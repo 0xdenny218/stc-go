@@ -19,12 +19,13 @@ type Inverse func() error
 type Context struct {
 	sh     *shared
 	parent *Context
+	fiber  *Fiber // 拥有此 context 的 fiber；非 fiber context 为 nil
 
-	values    map[Key]any
-	realmFor  map[Key]*realm
-	interc    map[Key][]interceptEntry
-	inverses  []Inverse
-	children  []*Context
+	values   map[Key]any
+	realmFor map[Key]*realm
+	interc   map[Key][]interceptEntry
+	inverses []Inverse
+	children []*Context
 
 	unwinding bool
 	closed    bool
@@ -37,11 +38,13 @@ type shared struct {
 	provides  map[provKey][]provideEntry
 	listeners map[string][]listenerEntry
 	trace     []TraceEvent
+	registry  map[uint64]*Fiber
 
 	// 服务变更广播：close-and-replace，供 WaitService 等待。
 	svcCh chan struct{}
+	// fiber 状态变更广播：close-and-replace，供 Ready/Gone 等待。
+	fiberCh chan struct{}
 
-	// orch 在 M2（fiber）启用前为 nil。
 	orch *orchestrator
 
 	pending atomic.Int64 // 运行中的 apply/unwind goroutine 数，静默判定用
@@ -64,6 +67,34 @@ func (a provideEntry) same(b provideEntry) bool {
 	return a.owner == b.owner && a.seq == b.seq
 }
 
+// provideIdent 是服务条目的代际标识：条目被替换即代际改变。
+type provideIdent struct {
+	owner *Context
+	seq   uint64
+}
+
+func (e provideEntry) ident() provideIdent {
+	return provideIdent{owner: e.owner, seq: e.seq}
+}
+
+// resolveExternal 解析 key，跳过 self 自己提供的条目——
+// fiber 不得以自身的提供满足自己的 inject（自给自足会破坏响应式）。
+func (c *Context) resolveExternal(key Key, self *Fiber) (any, provideIdent, bool) {
+	c.sh.mu.RLock()
+	defer c.sh.mu.RUnlock()
+	for r := c.realmForLocked(key); r != nil; r = r.parent {
+		st := c.sh.provides[provKey{realm: r, key: key}]
+		for i := len(st) - 1; i >= 0; i-- {
+			e := st[i]
+			if self != nil && e.owner.fiber == self {
+				continue
+			}
+			return e.value, e.ident(), true
+		}
+	}
+	return nil, provideIdent{}, false
+}
+
 type listenerEntry struct {
 	id    uint64 // sh.seq 分配，可比较的稳定标识（func 值本身不可比较）
 	owner *Context
@@ -75,13 +106,17 @@ type interceptEntry struct {
 	meta any
 }
 
-// New 创建根 context。
+// New 创建根 context 并启动 orchestrator。
 func New() *Context {
 	sh := &shared{
 		provides:  make(map[provKey][]provideEntry),
 		listeners: make(map[string][]listenerEntry),
+		registry:  make(map[uint64]*Fiber),
 		svcCh:     make(chan struct{}),
+		fiberCh:   make(chan struct{}),
 	}
+	sh.orch = newOrchestrator(sh)
+	sh.orch.start()
 	return &Context{sh: sh}
 }
 
@@ -258,7 +293,7 @@ func (c *Context) Provide(key Key, value any) (Inverse, error) {
 	c.sh.seq++
 	entry := provideEntry{owner: c, seq: c.sh.seq, value: value}
 	c.sh.provides[pk] = append(c.sh.provides[pk], entry)
-	c.sh.traceLocked(TraceProvide, 0, key.name)
+	c.sh.traceLocked(TraceProvide, entry.owner.fiberID(), key.name)
 	inv := func() error {
 		c.removeProvide(pk, entry)
 		return nil
@@ -285,7 +320,7 @@ func (c *Context) removeProvide(pk provKey, entry provideEntry) {
 	} else {
 		c.sh.provides[pk] = st
 	}
-	c.sh.traceLocked(TraceUnprovide, 0, pk.key.name)
+	c.sh.traceLocked(TraceUnprovide, entry.owner.fiberID(), pk.key.name)
 	c.sh.mu.Unlock()
 
 	c.sh.wakeServiceWatchers()
@@ -474,14 +509,30 @@ func (c *Context) Emit(name string, args ...any) {
 // 生命周期
 // ------------------------------------------------------------------
 
-// Close 回卷整个 context 树的根（M2 起会先终结全部 fiber 并停掉 orchestrator）。
+// Close 终结全部 fiber、停止 orchestrator，并回卷整个 context 树。
 func (c *Context) Close() error {
+	c.sh.orch.shutdown()
 	return c.unwind()
 }
 
 // ------------------------------------------------------------------
 // 追踪（验收测试断言用）
 // ------------------------------------------------------------------
+
+// fiberID 返回拥有此 context 的 fiber 编号（根/手动 context 为 0）。
+func (c *Context) fiberID() uint64 {
+	if c.fiber != nil {
+		return c.fiber.id
+	}
+	return 0
+}
+
+// traceUser 从任意 goroutine 记录事件。
+func (sh *shared) traceUser(kind TraceKind, fiber uint64) {
+	sh.mu.Lock()
+	sh.traceLocked(kind, fiber, "")
+	sh.mu.Unlock()
+}
 
 func (sh *shared) traceLocked(kind TraceKind, fiber uint64, key string) {
 	sh.seq++
