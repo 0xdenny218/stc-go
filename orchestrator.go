@@ -19,6 +19,7 @@ type orchestrator struct {
 	done  chan struct{}
 
 	cmds     atomic.Int64
+	inflight atomic.Int64 // 已提交未处理完毕的命令数（静默判定）
 	stopping atomic.Bool
 	stopOnce sync.Once
 }
@@ -48,10 +49,14 @@ func newOrchestrator(sh *shared) *orchestrator {
 func (o *orchestrator) start() { go o.run() }
 
 // send 入队一条命令。循环已退出时静默丢弃。
+// inflight 在入队前递增、在循环处理完毕后递减：从 inbox 取出命令会立刻
+// 使其清空，但处理尚未完成——静默判定必须依赖 inflight 而非队列长度。
 func (o *orchestrator) send(c cmd) {
+	o.inflight.Add(1)
 	select {
 	case o.inbox <- c:
 	case <-o.done:
+		o.inflight.Add(-1)
 	}
 }
 
@@ -64,6 +69,7 @@ func (o *orchestrator) run() {
 		o.cmds.Add(1)
 		o.handle(c)
 		o.settle()
+		o.inflight.Add(-1)
 		if o.stopping.Load() && o.quiescent() {
 			return
 		}
@@ -78,19 +84,13 @@ func (o *orchestrator) quiescent() bool {
 	return n == 0 && o.sh.pending.Load() == 0
 }
 
-// shutdown 显式撤退全部 fiber 并等待循环退出。幂等。
+// shutdown 停止系统并等待循环退出。幂等。
+// 撤退不在此处快照发送——快照会漏掉仍在 inbox 中的 cmdLoad（其 fiber
+// 尚未注册），漏网 fiber 永不撤退导致注册表无法清空。撤退决策统一
+// 收进 settle（循环内部，天然串行化），此处只置位并唤醒。
 func (o *orchestrator) shutdown() {
 	o.stopOnce.Do(func() {
 		o.stopping.Store(true)
-		o.sh.mu.RLock()
-		fs := make([]*Fiber, 0, len(o.sh.registry))
-		for _, f := range o.sh.registry {
-			fs = append(fs, f)
-		}
-		o.sh.mu.RUnlock()
-		for _, f := range fs {
-			o.send(cmdDispose{f: f})
-		}
 		o.send(cmdService{})
 		<-o.done
 	})
@@ -142,6 +142,11 @@ func (o *orchestrator) handle(c cmd) {
 		case f.disposeRequested:
 			o.beginUnload(f)
 		case f.depsSatisfied():
+			// 装载完成即与"当前"依赖代际一致：重新捕获快照。
+			// 装载中途的换血不触发重载（fiber 尚未服役，对应 Cordis
+			// inertia lock 2 的 applied-once 语义）；服役后的换血
+			// 才由 settle 的 depStale 触发重载。
+			f.captureDeps()
 			f.setState(StateActive)
 		default:
 			// 惯性：装载期间依赖消失，装载完成后直接卸载。
@@ -153,7 +158,7 @@ func (o *orchestrator) handle(c cmd) {
 		switch {
 		case f.failed:
 			o.removeFiber(f, StateFailed)
-		case f.disposeRequested:
+		case f.disposeRequested, o.stopping.Load():
 			o.removeFiber(f, StateGone)
 		case f.depsSatisfied():
 			// 惯性：卸载期间依赖恢复，立即重新装载。
@@ -167,7 +172,8 @@ func (o *orchestrator) handle(c cmd) {
 	}
 }
 
-// settle 推进到不动点：满足条件的 Pending→Loading、Active→Unloading。
+// settle 推进到不动点：依赖门控的 Pending→Loading 与 Active→Unloading；
+// stopping 期间不再发起新装载，并把一切在册 fiber 推向撤退。
 func (o *orchestrator) settle() {
 	for {
 		o.sh.mu.RLock()
@@ -179,17 +185,33 @@ func (o *orchestrator) settle() {
 		sort.Slice(fs, func(i, j int) bool { return fs[i].id < fs[j].id })
 
 		changed := false
+		stopping := o.stopping.Load()
 		for _, f := range fs {
 			switch f.State() {
 			case StatePending:
-				if f.depsSatisfied() {
+				switch {
+				case stopping && !f.disposeRequested:
+					f.disposeRequested = true
+					o.removeFiber(f, StateGone)
+					changed = true
+				case !stopping && f.depsSatisfied():
 					o.beginLoad(f)
 					changed = true
 				}
 			case StateActive:
-				if !f.depsSatisfied() {
+				switch {
+				case stopping && !f.disposeRequested:
+					f.disposeRequested = true
 					o.beginUnload(f)
 					changed = true
+				case !stopping && (!f.depsSatisfied() || f.depStale()):
+					// 依赖消失，或被无缝替换（代际改变）：卸载，恢复后重载。
+					o.beginUnload(f)
+					changed = true
+				}
+			case StateLoading, StateUnloading:
+				if stopping {
+					f.disposeRequested = true
 				}
 			}
 		}

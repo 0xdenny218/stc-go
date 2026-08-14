@@ -88,11 +88,12 @@ func TestInertiaLock2(t *testing.T) {
 	inv, _ := root.Provide(k, 1)
 	loaded := make(chan struct{})
 	release := make(chan struct{})
+	var once sync.Once
 	f := root.Load(Component{
 		Name:   "consumer",
 		Inject: []Key{k},
 		Apply: func(ctx *Context) (Inverse, error) {
-			close(loaded)
+			once.Do(func() { close(loaded) })
 			<-release
 			return nil, nil
 		},
@@ -346,6 +347,7 @@ func TestNestedLoad(t *testing.T) {
 	root := New()
 	defer root.Close()
 	k := UntypedKey("nested")
+	kOuter := UntypedKey("nested-outer")
 
 	var childEffect atomic.Int64
 	f := root.Load(Component{
@@ -369,7 +371,7 @@ func TestNestedLoad(t *testing.T) {
 			if err := child.Ready(stdctx.Background()); err != nil {
 				return nil, fmt.Errorf("inner: %w", err)
 			}
-			if _, err := ctx.Provide(k, "outer"); err != nil { // 覆盖 inner 的提供
+			if _, err := ctx.Provide(kOuter, "outer"); err != nil {
 				return nil, err
 			}
 			return nil, nil
@@ -379,9 +381,12 @@ func TestNestedLoad(t *testing.T) {
 	if err := f.Ready(g); err != nil {
 		t.Fatal(err)
 	}
-	// 后提供者胜：outer 覆盖 inner。
-	if v, _ := root.resolve(k); v != "outer" {
-		t.Fatalf("visible = %v, want outer", v)
+	// 各自的键各归其位（同键双 fiber 提供被良构性强制拒绝）。
+	if v, _ := root.resolve(k); v != "inner" {
+		t.Fatalf("inner visible = %v, want inner", v)
+	}
+	if v, _ := root.resolve(kOuter); v != "outer" {
+		t.Fatalf("outer visible = %v, want outer", v)
 	}
 	if got := childEffect.Load(); got != 1 {
 		t.Fatalf("child effect = %d, want 1", got)

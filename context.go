@@ -290,6 +290,15 @@ func (c *Context) Provide(key Key, value any) (Inverse, error) {
 	}
 	r := c.realmForLocked(key)
 	pk := provKey{realm: r, key: key}
+	// 良构性强制：同一键已有别的 fiber 提供者时拒绝（防止双提供者
+	// 互相触发依赖代际变化而无限抖动）。根/手动 context 的提供不在此列。
+	for _, e := range c.sh.provides[pk] {
+		if e.owner.fiber != nil && e.owner.fiber != c.fiber {
+			c.sh.mu.Unlock()
+			return nil, fmt.Errorf("%w: %q already provided by fiber %d",
+				ErrDuplicateProvide, key.name, e.owner.fiber.id)
+		}
+	}
 	c.sh.seq++
 	entry := provideEntry{owner: c, seq: c.sh.seq, value: value}
 	c.sh.provides[pk] = append(c.sh.provides[pk], entry)
@@ -433,6 +442,9 @@ func (c *Context) Intercept(key Key, meta any) error {
 	defer c.sh.mu.Unlock()
 	if c.closed || c.unwinding {
 		return ErrInactive
+	}
+	if c.interc == nil {
+		c.interc = make(map[Key][]interceptEntry)
 	}
 	c.sh.seq++
 	ie := interceptEntry{id: c.sh.seq, meta: meta}

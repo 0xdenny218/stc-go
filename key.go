@@ -52,4 +52,7 @@ var (
 	ErrInactive = errors.New("stc: inactive context")
 	// ErrNilInstall 表示 Effect 收到空的安装函数。
 	ErrNilInstall = errors.New("stc: nil install")
+	// ErrDuplicateProvide 表示某服务键已由另一个 fiber 提供。
+	// 对应论文 Definition 58 的良构性：每 (key, realm) 至多一个 fiber 提供者。
+	ErrDuplicateProvide = errors.New("stc: duplicate provide")
 )
