@@ -65,6 +65,22 @@ go test -race ./...
 go test -run Property -fuzz FuzzInterleaving -fuzztime 10s ./...
 ```
 
+## M4：WASM 组件装载（`stc/wasm`）
+
+模块实例化 = 引入，模块关闭 = 撤销（论文 §6.4 的运行时代码路线）：
+fiber 的依赖门控、惯性锁、精确回卷对 WASM 组件与 Go 组件一视同仁。
+
+- `wasm.Runtime` 封装 wazero（解释器配置，平台无关）与 `stc` 宿主模块；
+  guest 经导出函数 `start()/stop()` 参与生命周期，宿主函数
+  `provide/get/get_size/log` 在 fiber 自己的 context 上登记服务——
+  卸载回卷由 M1 机制保证，guest 无需自登记清理。
+- `wasm.Load` 先探针（编译+试实例化）再装载；`Handle.Update` 实现
+  原子换血：探针失败旧版本原样保留，start trap 自动用旧字节回滚。
+- 验收（`wasm/wasm_test.go`）：HMR 三契约（重载、跨边界依赖链、
+  失败回滚）+ 规格 Test/WasmRollback + T61 跨边界卸载精确性。
+- 测试 guest 为手写 WASM 二进制（`guest_test.go` 的微型编码器），
+  零工具链依赖。
+
 ## 与论文/Cordis 的已记录偏差
 
 - 无 Proxy：协效应访问走显式泛型 `stc.Service[T]`（论文 §6.4 认可的编译期路线）。
