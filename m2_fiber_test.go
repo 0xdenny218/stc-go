@@ -260,7 +260,12 @@ func TestProviderConsumerUpdate(t *testing.T) {
 	}
 
 	// provider 更新（撤退旧值、装载新值）与 consumer 的既有生命周期并发。
+	// 同键换血必须等旧提供者完全撤退（Gone），否则新提供者的 apply 会被
+	// ErrDuplicateProvide 拒绝（Def.58 的 fail-fast 语义）。
 	p1.Dispose()
+	if err := p1.Gone(g); err != nil {
+		t.Fatal(err)
+	}
 	p2 := root.Load(provider(2))
 	if err := p2.Ready(g); err != nil {
 		t.Fatal(err)

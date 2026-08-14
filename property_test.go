@@ -119,6 +119,8 @@ func TestPropertyPreservation(t *testing.T) {
 		rng := rand.New(rand.NewSource(int64(seed)))
 		root, comps, j, keys := genSystem(8, rng)
 		var fibers []*Fiber
+		var fiberComp []int // fiber 下标 → 组件下标（live 去重用）
+		live := map[int]bool{}
 		check := func() {
 			waitQuiet(t, root, fibers, 5*time.Second)
 			checkInvariants(t, root)
@@ -126,15 +128,32 @@ func TestPropertyPreservation(t *testing.T) {
 		for op := range 24 {
 			switch rng.Intn(3) {
 			case 0, 1:
-				gc := comps[rng.Intn(len(comps))]
-				fibers = append(fibers, root.Load(compOf(root, gc, j)))
+				// 只装载未在架的组件：同键重复装载被 ErrDuplicateProvide
+				// 拒绝（Def.58 的 fail-fast 语义），在本性质的前提范围之外。
+				var avail []int
+				for i := range comps {
+					if !live[i] {
+						avail = append(avail, i)
+					}
+				}
+				if len(avail) == 0 {
+					continue
+				}
+				i := avail[rng.Intn(len(avail))]
+				live[i] = true
+				fiberComp = append(fiberComp, i)
+				fibers = append(fibers, root.Load(compOf(root, comps[i], j)))
 			case 2:
 				if len(fibers) > 1 {
 					i := rng.Intn(len(fibers))
 					fibers[i].Dispose()
+					delete(live, fiberComp[i])
+					fiberComp = append(fiberComp[:i], fiberComp[i+1:]...)
 					fibers = append(fibers[:i], fibers[i+1:]...)
 				}
 			}
+			// 每次操作后推进到静默：上一步 Dispose 的撤退在此完成，
+			// 下一步的重新装载不会撞上未移除的同键条目。
 			check()
 			_ = op
 		}
@@ -144,16 +163,23 @@ func TestPropertyPreservation(t *testing.T) {
 }
 
 // checkInvariants 校验注册表良构性（T59 的不变量集）。
+// 仅在静默点调用（waitQuiet 之后），此时所有 fiber 处于终态。
 func checkInvariants(t *testing.T, root *Context) {
 	t.Helper()
 	sh := root.sh
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	for pk, st := range sh.provides {
+		fiberOwned := 0
 		for _, e := range st {
 			f := e.owner.fiber
 			if f == nil {
 				continue // 手动 context（根/Child）的提供，由其自身生命周期管理
+			}
+			fiberOwned++
+			// Def.58 良构性：每 (key, realm) 至多一个 fiber 提供者。
+			if fiberOwned > 1 {
+				t.Fatalf("invariant (Def.58): %q has %d fiber providers", pk.key.name, fiberOwned)
 			}
 			reg, ok := sh.registry[f.id]
 			if !ok {
@@ -162,10 +188,10 @@ func checkInvariants(t *testing.T, root *Context) {
 			if reg != f {
 				t.Fatalf("invariant: registry id collision on fiber %d", f.id)
 			}
-			switch f.State() {
-			case StateActive, StateLoading, StateUnloading:
-				// 转移中条目允许存在。
-			default:
+			// 静默点上拥有提供条目的 fiber 必须是 Active：
+			// Pending/Failed/Gone 的条目已被卸载移除，Loading/Unloading
+			// 不是终态，不会出现在静默点。
+			if f.State() != StateActive {
 				t.Fatalf("invariant: fiber %d state %v still owns provide of %q", f.id, f.State(), pk.key.name)
 			}
 		}
@@ -178,8 +204,8 @@ func checkInvariants(t *testing.T, root *Context) {
 			t.Fatalf("invariant: fiber %d has no home", id)
 		}
 		// fiber 的当前 context 必须挂在其 home 之下（parent 链可达 home）。
-		if f.ctx != nil {
-			for c := f.ctx; c != nil; c = c.parent {
+		if fc := f.ctxPtr.Load(); fc != nil {
+			for c := fc; c != nil; c = c.parent {
 				if c == f.home {
 					goto okCtx
 				}
@@ -353,6 +379,7 @@ func TestPropertyConfluence(t *testing.T) {
 		if run == 0 {
 			want = final
 			wantStates = states
+			root.Close()
 			continue
 		}
 		mustEqual(t, fmt.Sprintf("run %d confluence", run), final, want)

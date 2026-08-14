@@ -34,7 +34,19 @@
 | 拦截 | intercept(k, ν) | `Context.Intercept(key, meta)` |
 | 组件实例 | ⟨d,p,e,π,σ,τ,θ⟩ | `Fiber`（`Load` 创建，`Dispose` 撤退） |
 | 注册表 | dom(Fγ) | root `Context` 上的 fiber 注册表 |
-| fiber 状态 | τ | `Pending → Loading → Active → Unloading → (Pending \| Failed)` |
+| fiber 状态 | τ | `Pending → Loading → Active → Unloading → (Pending \| Failed)`；显式 `Dispose` → `Gone` |
+
+## 生命周期契约要点
+
+- `Close` 仅限根 context：关停 orchestrator 并回卷整棵树；非根作用域的
+  子树清理用 `Release`（不动系统）。
+- 同键服务换血必须等旧提供者完全撤退（`Dispose` 后 `Gone` 返回）再装载
+  新提供者；重叠窗口内的重复提供被 `ErrDuplicateProvide` 拒绝
+  （论文 Def.58 良构性的 fail-fast 强制）。
+- `Fiber.Context()` 返回当前装载周期的 context；惯性重载会更换它，
+  读到上一周期（已回卷）的 context 是合法的竞态结果。
+- `Gone()` 在 fiber 出册（Gone 或 Failed）时返回；`Ready()` 在 Active/
+  Failed/Gone 时返回（分别对应 nil / 装载错误 / `ErrDisposed`）。
 
 ## 验收 = 五条元理论定理（论文 §4.4）
 

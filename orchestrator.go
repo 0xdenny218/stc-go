@@ -18,6 +18,11 @@ type orchestrator struct {
 	inbox chan cmd
 	done  chan struct{}
 
+	// sendMu 与退出判定协同闭合发送竞态：退出前在 sendMu 内检查
+	// 无在飞命令并置 exited；send 在 sendMu 内检查 exited 并原子入队。
+	sendMu sync.Mutex
+	exited bool
+
 	cmds     atomic.Int64
 	inflight atomic.Int64 // 已提交未处理完毕的命令数（静默判定）
 	stopping atomic.Bool
@@ -48,19 +53,22 @@ func newOrchestrator(sh *shared) *orchestrator {
 
 func (o *orchestrator) start() { go o.run() }
 
-// send 入队一条命令。循环已退出时静默丢弃。
+// send 入队一条命令；返回 false 表示循环已退出（调用方必须感知）。
 // inflight 在入队前递增、在循环处理完毕后递减：从 inbox 取出命令会立刻
 // 使其清空，但处理尚未完成——静默判定必须依赖 inflight 而非队列长度。
-func (o *orchestrator) send(c cmd) {
-	o.inflight.Add(1)
-	select {
-	case o.inbox <- c:
-	case <-o.done:
-		o.inflight.Add(-1)
+// exited 检查与入队同在 sendMu 内：与循环的退出判定互斥，无漏发/漏停窗口。
+func (o *orchestrator) send(c cmd) bool {
+	o.sendMu.Lock()
+	defer o.sendMu.Unlock()
+	if o.exited {
+		return false
 	}
+	o.inflight.Add(1)
+	o.inbox <- c
+	return true
 }
 
-func (o *orchestrator) notifyService() { o.send(cmdService{}) }
+func (o *orchestrator) notifyService() { _ = o.send(cmdService{}) }
 
 func (o *orchestrator) run() {
 	defer close(o.done)
@@ -70,8 +78,16 @@ func (o *orchestrator) run() {
 		o.handle(c)
 		o.settle()
 		o.inflight.Add(-1)
-		if o.stopping.Load() && o.quiescent() {
-			return
+		if o.stopping.Load() {
+			// 退出判定与 send 互斥：此刻之后任何 send 都会因 exited 被拒，
+			// 不会有命令落在死信队列里。
+			o.sendMu.Lock()
+			if o.inflight.Load() == 0 && len(o.inbox) == 0 && o.quiescent() {
+				o.exited = true
+				o.sendMu.Unlock()
+				return
+			}
+			o.sendMu.Unlock()
 		}
 	}
 }
@@ -119,11 +135,13 @@ func (o *orchestrator) handle(c cmd) {
 
 	case cmdApplied:
 		f := c.f
+		o.sh.traceUser(TraceApplied, f.id)
 		if c.inv != nil {
 			inv := c.inv
+			ctx := f.ctxPtr.Load()
 			o.sh.mu.Lock()
-			if !f.ctx.unwinding {
-				f.ctx.inverses = append(f.ctx.inverses, inv)
+			if !ctx.unwinding {
+				ctx.inverses = append(ctx.inverses, inv)
 				inv = nil
 			}
 			o.sh.mu.Unlock()
@@ -141,6 +159,8 @@ func (o *orchestrator) handle(c cmd) {
 			o.beginUnload(f)
 		case f.disposeRequested:
 			o.beginUnload(f)
+		case o.stopping.Load():
+			o.beginUnload(f) // 关停期间完成装载的 fiber 直接撤退
 		case f.depsSatisfied():
 			// 装载完成即与"当前"依赖代际一致：重新捕获快照。
 			// 装载中途的换血不触发重载（fiber 尚未服役，对应 Cordis
@@ -155,6 +175,7 @@ func (o *orchestrator) handle(c cmd) {
 
 	case cmdUnwound:
 		f := c.f
+		o.sh.traceUser(TraceUnwound, f.id)
 		switch {
 		case f.failed:
 			o.removeFiber(f, StateFailed)
@@ -224,10 +245,12 @@ func (o *orchestrator) settle() {
 func (o *orchestrator) beginLoad(f *Fiber) {
 	// 每个装载周期使用全新 context：上一周期的 context 已被卸载永久关闭，
 	// 复用会让惯性重载的全部注册失效（Cordis 每次 mount 亦派生新 ctx）。
-	f.ctx = f.home.Child()
-	f.ctx.detach() // fiber 的 context 由其生命周期独占管理（D7）
+	// ctxPtr 原子写：Fiber.Context() 在用户 goroutine 上读。
+	ctx := f.home.Child()
+	ctx.detach() // fiber 的 context 由其生命周期独占管理（D7）
 	o.sh.mu.Lock()
-	f.ctx.fiber = f
+	ctx.fiber = f
+	f.ctxPtr.Store(ctx)
 	o.sh.mu.Unlock()
 
 	f.captureDeps()
@@ -241,19 +264,20 @@ func (o *orchestrator) beginLoad(f *Fiber) {
 	}
 	go func() {
 		o.sh.traceUser(TraceApplyStart, f.id)
-		inv, err := apply(f.ctx)
+		inv, err := apply(ctx)
 		o.sh.pending.Add(-1)
-		o.send(cmdApplied{f: f, inv: inv, err: err})
+		_ = o.send(cmdApplied{f: f, inv: inv, err: err})
 	}()
 }
 
 func (o *orchestrator) beginUnload(f *Fiber) {
 	f.setState(StateUnloading)
+	ctx := f.ctxPtr.Load()
 	o.sh.pending.Add(1)
 	go func() {
-		_ = f.ctx.unwind() // 逆错误已逐个记录（吞没语义）
+		_ = ctx.unwind() // 逆错误已逐个记录（吞没语义）
 		o.sh.pending.Add(-1)
-		o.send(cmdUnwound{f: f})
+		_ = o.send(cmdUnwound{f: f})
 	}()
 }
 
@@ -276,8 +300,8 @@ func (f *Fiber) depsSatisfied() bool {
 }
 
 func (f *Fiber) resolveBase() *Context {
-	if f.ctx != nil {
-		return f.ctx
+	if c := f.ctxPtr.Load(); c != nil {
+		return c
 	}
 	return f.home
 }

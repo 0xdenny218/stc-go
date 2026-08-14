@@ -56,7 +56,10 @@ type Fiber struct {
 	id   uint64
 	comp Component
 	home *Context // 装载目标（Load 的接收者）；每次装载在它之下派生新 ctx
-	ctx  *Context // 当前装载周期的 context（由 orchestrator 维护）
+
+	// 当前装载周期的 context：orchestrator 在每个装载周期重写，
+	// 用户经 Context() 读取——必须原子，否则与惯性重载构成数据竞争。
+	ctxPtr atomic.Pointer[Context]
 
 	state atomic.Uint32
 	err   error // apply 的错误（Failed 态）
@@ -86,7 +89,11 @@ func (c *Context) Load(comp Component) *Fiber {
 		return f
 	}
 	f.home = c
-	c.sh.orch.send(cmdLoad{f: f})
+	if !c.sh.orch.send(cmdLoad{f: f}) {
+		// orchestrator 已退出（Close 进行中/之后）：绝不悬挂。
+		f.err = ErrDisposed
+		f.state.Store(uint32(StateFailed))
+	}
 	return f
 }
 
@@ -106,13 +113,17 @@ func (f *Fiber) Err() error {
 	}
 	return nil
 }
-func (f *Fiber) Context() *Context { return f.ctx }
+
+// Context 返回当前装载周期的 context；惯性重载会更换它，
+// 调用方可能读到上一周期的（已回卷）context。
+func (f *Fiber) Context() *Context { return f.ctxPtr.Load() }
 
 // Ready 等待 fiber 进入稳定态：Active（装载完成）、Failed（装载出错）
 // 或 Gone（已撤退）。依赖缺失时 fiber 停在 Pending——Ready 会一直等待，
 // 需要超时控制请传入可取消的 ctx。
 func (f *Fiber) Ready(ctx stdctx.Context) error {
 	for {
+		ch := f.sh.waitCh() // 先订阅，后查状态（防丢失唤醒）
 		switch f.State() {
 		case StateActive:
 			return nil
@@ -121,7 +132,6 @@ func (f *Fiber) Ready(ctx stdctx.Context) error {
 		case StateGone:
 			return ErrDisposed
 		}
-		ch := f.sh.waitCh(f)
 		select {
 		case <-ch:
 		case <-ctx.Done():
@@ -130,13 +140,15 @@ func (f *Fiber) Ready(ctx stdctx.Context) error {
 	}
 }
 
-// Gone 等待 fiber 从注册表移除（显式 Dispose 完成）。
+// Gone 等待 fiber 撤出注册表：到达 Gone（显式撤退完成）或 Failed
+// （装载失败，已回卷出册）即返回——两者都是出册终态。
 func (f *Fiber) Gone(ctx stdctx.Context) error {
 	for {
-		if f.State() == StateGone {
+		ch := f.sh.waitCh() // 先订阅，后查状态
+		switch f.State() {
+		case StateGone, StateFailed:
 			return nil
 		}
-		ch := f.sh.waitCh(f)
 		select {
 		case <-ch:
 		case <-ctx.Done():
@@ -158,7 +170,7 @@ func (f *Fiber) setState(s FiberState) {
 // ------------------------------------------------------------------
 
 // waitCh/broadcast：close-and-replace 广播，供 Ready/Gone 等待状态变化。
-func (sh *shared) waitCh(f *Fiber) chan struct{} {
+func (sh *shared) waitCh() chan struct{} {
 	sh.mu.RLock()
 	defer sh.mu.RUnlock()
 	return sh.fiberCh

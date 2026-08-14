@@ -22,7 +22,7 @@ type Context struct {
 	fiber  *Fiber // 拥有此 context 的 fiber；非 fiber context 为 nil
 
 	values   map[Key]any
-	realmFor map[Key]*realm
+	realmFor map[Key]*Realm
 	interc   map[Key][]interceptEntry
 	inverses []Inverse
 	children []*Context
@@ -51,7 +51,7 @@ type shared struct {
 }
 
 type provKey struct {
-	realm *realm
+	realm *Realm
 	key   Key
 }
 
@@ -318,11 +318,19 @@ func (c *Context) Provide(key Key, value any) (Inverse, error) {
 func (c *Context) removeProvide(pk provKey, entry provideEntry) {
 	c.sh.mu.Lock()
 	st := c.sh.provides[pk]
+	removed := false
 	for i, x := range st {
 		if x.same(entry) {
 			st = append(st[:i], st[i+1:]...)
+			removed = true
 			break
 		}
+	}
+	if !removed {
+		// 重复撤销（手动 Inverse 与自动回卷各调一次）：完全幂等，
+		// 不动状态、不发通知、不记轨迹。
+		c.sh.mu.Unlock()
+		return
 	}
 	if len(st) == 0 {
 		delete(c.sh.provides, pk)
@@ -348,7 +356,7 @@ func (c *Context) resolve(key Key) (any, bool) {
 	return nil, false
 }
 
-func (c *Context) realmForLocked(key Key) *realm {
+func (c *Context) realmForLocked(key Key) *Realm {
 	for x := c; x != nil; x = x.parent {
 		if r, ok := x.realmFor[key]; ok {
 			return r
@@ -376,12 +384,12 @@ func Service[T any](c *Context, key Key) (T, error) {
 // 协效应侧的"响应式等待"原语。
 func (c *Context) WaitService(ctx stdctx.Context, key Key) (any, error) {
 	for {
+		c.sh.mu.RLock()
+		ch := c.sh.svcCh // 先订阅，后解析（防丢失唤醒）
+		c.sh.mu.RUnlock()
 		if v, ok := c.resolve(key); ok {
 			return v, nil
 		}
-		c.sh.mu.RLock()
-		ch := c.sh.svcCh
-		c.sh.mu.RUnlock()
 		select {
 		case <-ch:
 		case <-ctx.Done():
@@ -411,7 +419,7 @@ func (sh *shared) notifyOrch() {
 
 // Isolate 声明：在此 context 子树内，key 解析到 realm r 而非外层 realm。
 // 撤销效应会在回卷时移除该声明。
-func (c *Context) Isolate(key Key, r *realm) error {
+func (c *Context) Isolate(key Key, r *Realm) error {
 	if r == nil {
 		r = rootRealm
 	}
@@ -421,7 +429,7 @@ func (c *Context) Isolate(key Key, r *realm) error {
 		return ErrInactive
 	}
 	if c.realmFor == nil {
-		c.realmFor = map[Key]*realm{}
+		c.realmFor = map[Key]*Realm{}
 	}
 	c.realmFor[key] = r
 	c.inverses = append(c.inverses, func() error {
@@ -521,11 +529,20 @@ func (c *Context) Emit(name string, args ...any) {
 // 生命周期
 // ------------------------------------------------------------------
 
-// Close 终结全部 fiber、停止 orchestrator，并回卷整个 context 树。
+// Close 仅限根 context：终结全部 fiber、停止 orchestrator，并回卷整棵树。
+// 对非根 context 调用返回 ErrNotRoot——orchestrator 是整树共享的单例，
+// 若允许任意作用域关停全局，会静默撤退无关 fiber 并使整树僵尸化。
+// 非根作用域的清理用 Release（仅回卷子树，不动系统）。
 func (c *Context) Close() error {
+	if c.parent != nil {
+		return ErrNotRoot
+	}
 	c.sh.orch.shutdown()
 	return c.unwind()
 }
+
+// Release 回卷该 context 的子树（不停止 orchestrator）。
+func (c *Context) Release() error { return c.unwind() }
 
 // ------------------------------------------------------------------
 // 追踪（验收测试断言用）
@@ -546,12 +563,21 @@ func (sh *shared) traceUser(kind TraceKind, fiber uint64) {
 	sh.mu.Unlock()
 }
 
+// traceCap 是轨迹的最大保留条数：轨迹服务于验收测试与调试，
+// 不允许在生产负载下无界增长；超出后丢弃最旧事件（Seq 仍单调）。
+const traceCap = 8192
+
 func (sh *shared) traceLocked(kind TraceKind, fiber uint64, key string) {
 	sh.seq++
+	if len(sh.trace) >= traceCap {
+		copy(sh.trace, sh.trace[1:])
+		sh.trace = sh.trace[:traceCap-1]
+	}
 	sh.trace = append(sh.trace, TraceEvent{Seq: sh.seq, Kind: kind, Fiber: fiber, Key: key})
 }
 
-// Trace 返回事件轨迹的拷贝。
+// Trace 返回事件轨迹的拷贝。轨迹有界（最近 traceCap 条），
+// 供验收测试与调试使用；Seq 全局单调，可用于判定缺口。
 func (c *Context) Trace() []TraceEvent {
 	c.sh.mu.RLock()
 	defer c.sh.mu.RUnlock()
