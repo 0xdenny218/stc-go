@@ -6,6 +6,10 @@
 //
 //   - 模块不得使用 wasm start section（探针实例化会执行它）；
 //     生命周期入口是导出的 start()/stop() 函数（均可选）。
+//   - 导出的 _initialize()（reactor 模式工具链的运行时初始化，如
+//     TinyGo -buildmode=c-shared）若存在，会在 start 之前调用一次。
+//   - wasi_snapshot_preview1 始终实例化，guest 可以自由 import WASI
+//     （TinyGo 等工具链无条件需要 fd_write/proc_exit 等）。
 //   - 使用宿主函数的模块必须导出名为 "memory" 的内存。
 //   - 宿主模块 "stc"：
 //     provide(key_ptr,key_len,val_ptr,val_len) i32  — 提供字符串服务；0 成功
@@ -26,6 +30,7 @@ import (
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
+	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
 
 	"github.com/0xdenny218/stc-go"
 )
@@ -62,6 +67,9 @@ func NewRuntime() (*Runtime, error) {
 	if err != nil {
 		return nil, fmt.Errorf("wasm: host module: %w", err)
 	}
+	// WASI 始终可用：TinyGo 等工具链产出的模块无条件 import 若干
+	// wasi_snapshot_preview1 函数（fd_write/proc_exit 等）。
+	wasi_snapshot_preview1.MustInstantiate(stdctx.Background(), r.rt)
 	return r, nil
 }
 
@@ -117,10 +125,15 @@ func (r *Runtime) Component(src []byte, opts Options) stc.Component {
 			if err != nil {
 				return nil, fmt.Errorf("wasm: instantiate %s: %w", opts.Name, err)
 			}
-			if start := mod.ExportedFunction("start"); start != nil {
-				if _, err := start.Call(callCtx); err != nil {
-					_ = mod.Close(stdctx.Background())
-					return nil, fmt.Errorf("wasm: start %s: %w", opts.Name, err)
+			// _initialize 是 reactor 模式工具链（如 TinyGo -buildmode=c-shared）
+			// 的运行时初始化入口，按约定必须先于其他导出函数调用。
+			// 它与 start 同属启动序列：失败（含 trap）同样关闭模块并上报装载错误。
+			for _, entry := range []string{"_initialize", "start"} {
+				if fn := mod.ExportedFunction(entry); fn != nil {
+					if _, err := fn.Call(callCtx); err != nil {
+						_ = mod.Close(stdctx.Background())
+						return nil, fmt.Errorf("wasm: %s %s: %w", entry, opts.Name, err)
+					}
 				}
 			}
 			return func() error {
