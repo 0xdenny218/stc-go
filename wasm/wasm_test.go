@@ -279,3 +279,30 @@ func TestWasmInjectGating(t *testing.T) {
 		t.Fatalf("echo = %q, %v; want late", v, err)
 	}
 }
+
+// 回归（e2e 发现）：TinyGo 等工具链产物的模块名段固定（恒为 "main"），
+// Update 的探针/新实例与现役旧实例撞名，被 wazero 拒绝。
+// 唯一实例名派生后，同名模块的原子换血必须成功。
+func TestWasmUpdateSameModuleName(t *testing.T) {
+	root, rt := setup(t)
+	greeting := rt.Key("greeting")
+
+	rec := &recorder{}
+	cf := root.Load(rec.component(greeting))
+
+	h, err := Load(bg(), root, rt, withModuleName(helloGuest("v1"), "main"), Options{
+		Name: "hello", Provide: []string{"greeting"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cf.Ready(bg()); err != nil {
+		t.Fatal(err)
+	}
+	waitSeen(t, rec, "v1")
+
+	if err := h.Update(bg(), withModuleName(helloGuest("v2"), "main")); err != nil {
+		t.Fatalf("update same-named module: %v", err)
+	}
+	waitSeen(t, rec, "v2")
+}

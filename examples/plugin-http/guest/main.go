@@ -8,7 +8,7 @@ import "github.com/0xdenny218/stc-go/guest"
 
 //export start
 func start() {
-	if err := guest.Provide("wasm-message", "hello from TinyGo guest v1"); err != nil {
+	if err := guest.Provide("wasm-message", "hello from TinyGo guest v3"); err != nil {
 		panic(err)
 	}
 }

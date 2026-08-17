@@ -46,6 +46,7 @@ type Runtime struct {
 	conf wazero.ModuleConfig
 
 	mu   sync.Mutex
+	seq  uint64
 	keys map[string]stc.Key
 	logs []string
 }
@@ -96,6 +97,17 @@ func (r *Runtime) Logs() []string {
 	return append([]string(nil), r.logs...)
 }
 
+// instanceConfig 派生带唯一模块名的实例化配置：wazero 要求同运行时内
+// 实例名唯一，而工具链产出的模块名段是固定的（如 TinyGo 一律 "main"），
+// 不换名则 Update 的探针实例与现役旧实例冲突。
+func (r *Runtime) instanceConfig(name string) wazero.ModuleConfig {
+	r.mu.Lock()
+	r.seq++
+	n := r.seq
+	r.mu.Unlock()
+	return r.conf.WithName(fmt.Sprintf("%s-%d", name, n))
+}
+
 // Options 是 WASM 组件的静态描述。
 type Options struct {
 	Name    string
@@ -121,7 +133,7 @@ func (r *Runtime) Component(src []byte, opts Options) stc.Component {
 		Provide: provide,
 		Apply: func(c *stc.Context) (stc.Inverse, error) {
 			callCtx := stdctx.WithValue(stdctx.Background(), fiberCtxKey{}, c)
-			mod, err := r.rt.InstantiateWithConfig(callCtx, src, r.conf)
+			mod, err := r.rt.InstantiateWithConfig(callCtx, src, r.instanceConfig(opts.Name))
 			if err != nil {
 				return nil, fmt.Errorf("wasm: instantiate %s: %w", opts.Name, err)
 			}
@@ -149,8 +161,8 @@ func (r *Runtime) Component(src []byte, opts Options) stc.Component {
 
 // probe 编译并试实例化 src（不调用 start）：
 // 捕获二进制错误、导入不匹配等实例化级失败。
-func (r *Runtime) probe(src []byte) error {
-	mod, err := r.rt.InstantiateWithConfig(stdctx.Background(), src, r.conf)
+func (r *Runtime) probe(name string, src []byte) error {
+	mod, err := r.rt.InstantiateWithConfig(stdctx.Background(), src, r.instanceConfig(name))
 	if err != nil {
 		return err
 	}
@@ -171,7 +183,7 @@ type Handle struct {
 // Load 探针校验后装载 WASM 组件，并等待其到达稳定态
 // （Active 或 Failed——依赖未满足时阻塞在 Pending，用 ctx 控制超时）。
 func Load(ctx stdctx.Context, c *stc.Context, rt *Runtime, src []byte, opts Options) (*Handle, error) {
-	if err := rt.probe(src); err != nil {
+	if err := rt.probe(opts.Name, src); err != nil {
 		return nil, fmt.Errorf("wasm: probe %s: %w", opts.Name, err)
 	}
 	f := c.Load(rt.Component(src, opts))
@@ -199,7 +211,7 @@ func (h *Handle) Update(ctx stdctx.Context, src []byte) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if err := h.rt.probe(src); err != nil {
+	if err := h.rt.probe(h.opts.Name, src); err != nil {
 		return fmt.Errorf("wasm: update probe failed, old version intact: %w", err)
 	}
 	old := h.fiber

@@ -208,3 +208,11 @@ func trapGuest() []byte {
 func badGuest() []byte {
 	return []byte{0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x00, 0x00}
 }
+
+// withModuleName 给模块追加 name section 的模块名子节，
+// 模拟工具链产物（TinyGo 的模块名恒为 "main"）。
+// 回归场景：同名模块 Update 不得因实例名冲突失败。
+func withModuleName(src []byte, modName string) []byte {
+	sub := cat([]byte{0x00}, uleb(uint64(len(modName)+1)), name(modName))
+	return cat(src, section(0, cat(name("name"), sub)))
+}
