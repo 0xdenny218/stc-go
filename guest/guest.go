@@ -71,3 +71,55 @@ func Log(msg string) {
 	p, l := strarg(msg)
 	hostLog(p, l)
 }
+
+// ------------------------------------------------------------------
+// host→guest 调用（wasm.Handle.Call 的 guest 侧；ABI 见 stc-go/wasm 包文档）
+// ------------------------------------------------------------------
+
+var (
+	invokeHandler func(args string) string
+	callBufs      = map[uint32][]byte{} // 宿主可见缓冲的保活表，stc_free 删除
+)
+
+// OnInvoke 注册 "invoke" 调用的处理器：宿主经
+// wasm.Handle.Call(ctx, "invoke", args) 触发，入参与返回值都是字符串
+// （协议层通常携带 JSON）。应在模块开始服务调用前注册（包级变量初始化
+// 或 start 内均可）。
+func OnInvoke(fn func(args string) string) { invokeHandler = fn }
+
+// stc_alloc 为宿主分配可写缓冲（宿主随后写入调用入参）；缓冲登记在
+// callBufs 防 GC，stc_free 时删除。
+//
+//export stc_alloc
+func stcAlloc(n uint32) uint32 {
+	buf := make([]byte, n)
+	ptr := uint32(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
+	callBufs[ptr] = buf
+	return ptr
+}
+
+//export stc_free
+func stcFree(ptr, _ uint32) { delete(callBufs, ptr) }
+
+// invoke 是 host→guest 调用的固定入口：解包入参 → 调 OnInvoke 注册的
+// 处理器 → 把结果拷入受管缓冲并打包 (指针<<32)|长度 返回。
+//
+//export invoke
+func invoke(ptr, n uint32) uint64 {
+	if invokeHandler == nil {
+		return 0
+	}
+	var arg string
+	if n > 0 {
+		arg = string(unsafe.Slice((*byte)(unsafe.Pointer(uintptr(ptr))), int(n)))
+	}
+	res := invokeHandler(arg)
+	if len(res) == 0 {
+		return 0
+	}
+	buf := make([]byte, len(res))
+	copy(buf, res)
+	rp := uint32(uintptr(unsafe.Pointer(unsafe.SliceData(buf))))
+	callBufs[rp] = buf
+	return uint64(rp)<<32 | uint64(len(buf))
+}
