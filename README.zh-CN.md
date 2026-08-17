@@ -141,16 +141,58 @@ go test -run Property -fuzz FuzzInterleaving -fuzztime 10s ./...
 fiber 的依赖门控、惯性锁、精确回卷对 WASM 组件与 Go 组件一视同仁。
 
 - `wasm.Runtime` 封装 [wazero](https://github.com/tetratelabs/wazero)
-  （解释器配置，平台无关）与 `stc` 宿主模块；guest 经导出函数
-  `start()/stop()` 参与生命周期，宿主函数 `provide/get/get_size/log`
-  在 fiber 自己的 context 上登记服务——卸载回卷由核心机制保证，
-  guest 无需自登记清理。
+  （解释器配置，平台无关）与 `stc` 宿主模块；`wasi_snapshot_preview1`
+  始终实例化，工具链产物开箱即用。guest 经导出函数 `start()/stop()`
+  参与生命周期（reactor 模式的 `_initialize()` 会在 start 前调用）；
+  宿主函数 `provide/get/get_size/log` 在 fiber 自己的 context 上登记
+  服务——卸载回卷由核心机制保证，guest 无需自登记清理。
 - `wasm.Load` 先探针（编译+试实例化）再装载；`Handle.Update` 实现
   原子换血：探针失败旧版本原样保留，start trap 自动用旧字节回滚。
 - 验收（`wasm/wasm_test.go`）：HMR 三契约（重载、跨边界依赖链、
   失败回滚）+ 规格 Test/WasmRollback + T61 跨边界卸载精确性。
 - 测试 guest 为手写 WASM 二进制（`guest_test.go` 的微型编码器），
   零工具链依赖。
+
+### 用 Go 写 guest（`stc-go/guest`）
+
+guest 就是普通的 Go，用 [TinyGo](https://tinygo.org/) 对着 guest 侧
+SDK 编译：
+
+```go
+//go:build wasm
+
+package main
+
+import "github.com/0xdenny218/stc-go/guest"
+
+//export start
+func start() {
+	_ = guest.Provide("wasm-message", "hello from a guest")
+}
+
+//export stop
+func stop() { guest.Log("bye") }
+
+func main() {} // reactor 模式：入口是 start/stop
+```
+
+```sh
+tinygo build -target wasip1 -buildmode=c-shared -o guest.wasm .
+```
+
+### 热重载（`stc-go/hmr`）
+
+`hmr.Watch(ctx, handle, "guest.wasm")` 监听文件（目录级，兼容原子保存
+的 rename 形态），防抖后对每次变化执行 `Handle.Update`。更新失败时
+旧版本继续服役；结果经 `OnReload` 回调上报。
+
+## 示例应用
+
+[`examples/plugin-http`](examples/plugin-http) 是一个插件式 HTTP
+服务器：路由是可逆效应（卸载精确摘除）、服务重提供触发级联重载、
+TinyGo WASM guest 经 Go 桥插件对外提供字符串、重编译即热重载。
+开箱可跑（目录内 `go run .`，已提交预构建 guest）；导览见该目录
+README。
 
 ## 与 Cordis / DeepSeek Harness 的关系
 

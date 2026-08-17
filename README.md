@@ -149,11 +149,13 @@ Module instantiation = introduction, module close = withdrawal (the paper's
 apply to WASM guests exactly as to Go components.
 
 - `wasm.Runtime` wraps [wazero](https://github.com/tetratelabs/wazero)
-  (interpreter config, platform-independent) plus an `stc` host module. Guests
-  participate via exported `start()`/`stop()`; host functions
-  `provide/get/get_size/log` register services on the fiber's own context —
-  rewind on unload is guaranteed by the core mechanism, guests register no
-  cleanup themselves.
+  (interpreter config, platform-independent) plus an `stc` host module;
+  `wasi_snapshot_preview1` is always instantiated, so toolchain-built
+  guests work out of the box. Guests participate via exported
+  `start()`/`stop()` (reactor-mode `_initialize()` is honored before
+  `start`); host functions `provide/get/get_size/log` register services on
+  the fiber's own context — rewind on unload is guaranteed by the core
+  mechanism, guests register no cleanup themselves.
 - `wasm.Load` probes (compile + trial instantiation) before loading;
   `Handle.Update` performs atomic hot-swap: probe failure leaves the old
   version intact, a start trap rolls back to the old bytes automatically.
@@ -162,6 +164,49 @@ apply to WASM guests exactly as to Go components.
   + T61 cross-boundary unload exactness.
 - Test guests are hand-encoded WASM binaries (a tiny encoder in
   `guest_test.go`) — zero toolchain dependencies.
+
+### Writing guests in Go (`stc-go/guest`)
+
+Guests are plain Go compiled with [TinyGo](https://tinygo.org/) against the
+guest-side SDK:
+
+```go
+//go:build wasm
+
+package main
+
+import "github.com/0xdenny218/stc-go/guest"
+
+//export start
+func start() {
+	_ = guest.Provide("wasm-message", "hello from a guest")
+}
+
+//export stop
+func stop() { guest.Log("bye") }
+
+func main() {} // reactor mode: entry points are start/stop
+```
+
+```sh
+tinygo build -target wasip1 -buildmode=c-shared -o guest.wasm .
+```
+
+### Hot reload (`stc-go/hmr`)
+
+`hmr.Watch(ctx, handle, "guest.wasm")` watches the file (directory-level,
+survives atomic-save renames), debounces, and runs `Handle.Update` on every
+change. Failed updates keep the old version serving; results are reported
+through an `OnReload` callback.
+
+## Example application
+
+[`examples/plugin-http`](examples/plugin-http) is a plugin HTTP server where
+every feature is a fiber: routes as revertible effects (exact removal on
+unload), cascading reloads on service re-provision, a TinyGo WASM guest
+serving a string through a Go bridge fiber, and live hot reload on rebuild.
+Runs out of the box (`go run .` in that directory, prebuilt guest committed);
+see its README for a guided tour.
 
 ## Relation to Cordis and DeepSeek Harness
 
