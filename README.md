@@ -1,5 +1,7 @@
 # stc-go
 
+**English** | [简体中文](README.zh-CN.md)
+
 [![CI](https://github.com/0xdenny218/stc-go/actions/workflows/ci.yml/badge.svg)](https://github.com/0xdenny218/stc-go/actions/workflows/ci.yml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/0xdenny218/stc-go.svg)](https://pkg.go.dev/github.com/0xdenny218/stc-go)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -15,8 +17,6 @@ stc-go is specified directly by the paper
 (pinned at `8cc9e33`) serves only as a reference and a source of test scenarios.
 The acceptance criteria are the paper's five metatheory theorems, implemented as
 property-based tests.
-
-> 中文：[时空可组合性范式](#中文简介)的 Go 实现——论文为规格、五定理为验收，非 Cordis 移植。
 
 ## The paradigm at a glance
 
@@ -201,25 +201,6 @@ Go plugin package (which cannot unload), and WASM for runtime-loaded code.
 - Effect accumulation happens at registration (return values of
   `Effect`/`Apply`); the paper's iterator-style continuous yield is not
   implemented — no acceptance scenario depends on it.
-
-## 中文简介
-
-stc-go 是时空可组合性范式的 Go 实现。该范式由论文
-《A Programming Paradigm for Spatiotemporal Composability》定义，
-TypeScript 侧的实现是 Cordis（Koishi 生态的底座），DeepSeek 的 agent
-harness（DeepSeek Harness / dsh，"一切皆插件"）即建立在 Cordis 之上。
-
-- **时间可组合性**：组件注册的每个副作用都携带逆操作，卸载时按 LIFO 逆序
-  精确回卷；
-- **空间可组合性**：组件声明依赖，运行时响应式地管理依赖的满足与失效，
-  依赖变化时 fiber 自动重载；
-- **验收即定理**：论文 §4.4 的五条元理论定理逐条落成 property-based 测试
-  （`-race` + 随机调度 + fuzz）；
-- **WASM 组件**（`stc-go/wasm`）：基于 wazero，模块实例化=引入、关闭=撤销，
-  `Handle.Update` 原子换血，失败自动回滚旧版本。
-
-本项目以论文为唯一规格，**不是** Cordis 的移植；Cordis 仅作语义参考与
-测试语料库。详见上文英文文档。
 
 ## License
 
