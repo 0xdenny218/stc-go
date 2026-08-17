@@ -1,4 +1,4 @@
-module stc
+module github.com/0xdenny218/stc-go
 
 go 1.25.0
 

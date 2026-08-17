@@ -27,7 +27,7 @@ import (
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/api"
 
-	"stc"
+	"github.com/0xdenny218/stc-go"
 )
 
 // fiberCtxKey 把 fiber 的 *stc.Context 挂到 start/stop 的调用上下文上，

@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"stc"
+	"github.com/0xdenny218/stc-go"
 )
 
 // recorder 是注入 key 并记录每次装载观察值的 Go 消费者组件。
