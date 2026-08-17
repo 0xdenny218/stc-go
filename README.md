@@ -159,9 +159,17 @@ apply to WASM guests exactly as to Go components.
 - `wasm.Load` probes (compile + trial instantiation) before loading;
   `Handle.Update` performs atomic hot-swap: probe failure leaves the old
   version intact, a start trap rolls back to the old bytes automatically.
-- Acceptance (`wasm/wasm_test.go`): the three HMR contracts (reload,
-  cross-boundary dependency chain, failure rollback) + spec Test/WasmRollback
-  + T61 cross-boundary unload exactness.
+- `Handle.Call(ctx, name, arg)` calls an exported guest function over an
+  all-string ABI (the guest exports `stc_alloc`; the callee takes
+  `(ptr, len)` and returns the result packed as `(ptr<<32)|len`; an optional
+  `stc_free` releases both buffers). Call and Update hold the same lock: an
+  in-flight call finishes untorn, Update waits, and calls placed after an
+  Update land on the new version.
+- Acceptance (`wasm/wasm_test.go`, `wasm/call_test.go`): the three HMR
+  contracts (reload, cross-boundary dependency chain, failure rollback) +
+  spec Test/WasmRollback + T61 cross-boundary unload exactness + the Call
+  contracts (round-trip, buffer release, bad-build keeps serving,
+  Update–Call mutual exclusion under `-race`).
 - Test guests are hand-encoded WASM binaries (a tiny encoder in
   `guest_test.go`) — zero toolchain dependencies.
 
@@ -191,6 +199,18 @@ func main() {} // reactor mode: entry points are start/stop
 ```sh
 tinygo build -target wasip1 -buildmode=c-shared -o guest.wasm .
 ```
+
+For host→guest calls the SDK itself exports `stc_alloc`/`stc_free` and the
+`invoke` entry point — a guest just registers a handler, no extra `//export`
+boilerplate:
+
+```go
+func init() {
+	guest.OnInvoke(func(args string) string { return `{"echo":` + args + `}` })
+}
+```
+
+and the host invokes it with `handle.Call(ctx, "invoke", args)`.
 
 ### Hot reload (`stc-go/hmr`)
 

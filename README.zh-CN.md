@@ -148,8 +148,15 @@ fiber 的依赖门控、惯性锁、精确回卷对 WASM 组件与 Go 组件一�
   服务——卸载回卷由核心机制保证，guest 无需自登记清理。
 - `wasm.Load` 先探针（编译+试实例化）再装载；`Handle.Update` 实现
   原子换血：探针失败旧版本原样保留，start trap 自动用旧字节回滚。
-- 验收（`wasm/wasm_test.go`）：HMR 三契约（重载、跨边界依赖链、
-  失败回滚）+ 规格 Test/WasmRollback + T61 跨边界卸载精确性。
+- `Handle.Call(ctx, name, arg)` 以全字符串 ABI 调用 guest 导出函数
+  （guest 导出 `stc_alloc`；被调函数收 `(ptr, len)`、返回打包为
+  `(ptr<<32)|len` 的结果；可选 `stc_free` 释放入参与结果两块缓冲）。
+  Call 与 Update 持同一把锁：进行中的调用完整跑完、Update 等待，
+  Update 落定后的调用走新版本。
+- 验收（`wasm/wasm_test.go`、`wasm/call_test.go`）：HMR 三契约
+  （重载、跨边界依赖链、失败回滚）+ 规格 Test/WasmRollback +
+  T61 跨边界卸载精确性 + Call 契约（往返、缓冲释放、坏构建旧版本
+  服役、-race 下 Update–Call 互斥）。
 - 测试 guest 为手写 WASM 二进制（`guest_test.go` 的微型编码器），
   零工具链依赖。
 
@@ -179,6 +186,17 @@ func main() {} // reactor 模式：入口是 start/stop
 ```sh
 tinygo build -target wasip1 -buildmode=c-shared -o guest.wasm .
 ```
+
+host→guest 调用的 `stc_alloc`/`stc_free` 与 `invoke` 入口由 SDK 自己
+导出——guest 只需注册处理器，无需额外 `//export` 样板：
+
+```go
+func init() {
+	guest.OnInvoke(func(args string) string { return `{"echo":` + args + `}` })
+}
+```
+
+宿主侧经 `handle.Call(ctx, "invoke", args)` 触发调用。
 
 ### 热重载（`stc-go/hmr`）
 

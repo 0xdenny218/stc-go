@@ -20,6 +20,19 @@
 // 宿主调用经 start/stop 的调用上下文拿到 fiber 的 *stc.Context，
 // 因此 start 内 provide 的服务全部登记在 fiber 自己的 context 上，
 // 卸载时由 M1 的逆操作机制精确回卷——模块无需自己登记清理逻辑。
+//
+// Host→guest 调用（Handle.Call；值一律为字符串）：
+//
+//   - 模块须导出 "memory" 与 stc_alloc(size i32) i32（返回可写缓冲指针）；
+//   - 被调函数的签名须为 (ptr i32, len i32) i64：入参是宿主经 stc_alloc
+//     写入的字符串，返回值打包 (结果指针<<32)|结果长度；结果内存由
+//     guest 持有，Call 返回前已被宿主拷出；
+//   - 若导出 stc_free(ptr i32, len i32)，宿主在调用完成后用它释放
+//     入参与结果两块缓冲。
+//
+// Call 与 Update 互斥（同一把锁）：进行中的调用完整跑完、Update 等待，
+// Update 落定后的调用走新版本。同一 Handle 的并发 Call 也被串行化
+// （wazero 模块实例不支持并发调用）。
 package wasm
 
 import (
@@ -119,6 +132,30 @@ type Options struct {
 // Apply = 实例化 + 调用 start；Inverse = 调用 stop + 关闭模块实例。
 // start 失败（含 trap）时模块立即关闭并作为装载错误上报（fiber → Failed）。
 func (r *Runtime) Component(src []byte, opts Options) stc.Component {
+	return r.component(src, opts, nil)
+}
+
+// instanceRef 把 Apply 内实例化的模块交接给 Handle（换血时逐代更新）。
+// mod 为 nil 表示当前无活跃实例（装载窗口期或 fiber 已卸载）。
+type instanceRef struct {
+	mu   sync.RWMutex
+	mod  api.Module
+	fctx *stc.Context // 装载该实例的 fiber 的 context（宿主函数用）
+}
+
+func (r *instanceRef) set(mod api.Module, fctx *stc.Context) {
+	r.mu.Lock()
+	r.mod, r.fctx = mod, fctx
+	r.mu.Unlock()
+}
+
+func (r *instanceRef) get() (api.Module, *stc.Context) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.mod, r.fctx
+}
+
+func (r *Runtime) component(src []byte, opts Options, ref *instanceRef) stc.Component {
 	inject := make([]stc.Key, len(opts.Inject))
 	for i, n := range opts.Inject {
 		inject[i] = r.Key(n)
@@ -148,7 +185,13 @@ func (r *Runtime) Component(src []byte, opts Options) stc.Component {
 					}
 				}
 			}
+			if ref != nil {
+				ref.set(mod, c)
+			}
 			return func() error {
+				if ref != nil {
+					ref.set(nil, nil)
+				}
 				var err error
 				if stop := mod.ExportedFunction("stop"); stop != nil {
 					_, err = stop.Call(callCtx)
@@ -169,7 +212,8 @@ func (r *Runtime) probe(name string, src []byte) error {
 	return mod.Close(stdctx.Background())
 }
 
-// Handle 是已装载 WASM 组件的管理句柄，提供带回滚的版本更新。
+// Handle 是已装载 WASM 组件的管理句柄，提供带回滚的版本更新与
+// host→guest 带参调用（Call）。
 type Handle struct {
 	rt   *Runtime
 	home *stc.Context
@@ -178,6 +222,7 @@ type Handle struct {
 	mu    sync.Mutex
 	src   []byte
 	fiber *stc.Fiber
+	ref   *instanceRef
 }
 
 // Load 探针校验后装载 WASM 组件，并等待其到达稳定态
@@ -186,11 +231,12 @@ func Load(ctx stdctx.Context, c *stc.Context, rt *Runtime, src []byte, opts Opti
 	if err := rt.probe(opts.Name, src); err != nil {
 		return nil, fmt.Errorf("wasm: probe %s: %w", opts.Name, err)
 	}
-	f := c.Load(rt.Component(src, opts))
+	ref := &instanceRef{}
+	f := c.Load(rt.component(src, opts, ref))
 	if err := f.Ready(ctx); err != nil {
 		return nil, fmt.Errorf("wasm: load %s: %w", opts.Name, err)
 	}
-	return &Handle{rt: rt, home: c, opts: opts, src: src, fiber: f}, nil
+	return &Handle{rt: rt, home: c, opts: opts, src: src, fiber: f, ref: ref}, nil
 }
 
 // Fiber 返回当前版本对应的 fiber（每次成功 Update 后更换）。
@@ -219,9 +265,9 @@ func (h *Handle) Update(ctx stdctx.Context, src []byte) error {
 	if err := old.Gone(ctx); err != nil {
 		return fmt.Errorf("wasm: update: waiting old version gone: %w", err)
 	}
-	nf := h.home.Load(h.rt.Component(src, h.opts))
+	nf := h.home.Load(h.rt.component(src, h.opts, h.ref))
 	if err := nf.Ready(ctx); err != nil {
-		rb := h.home.Load(h.rt.Component(h.src, h.opts))
+		rb := h.home.Load(h.rt.component(h.src, h.opts, h.ref))
 		if rbErr := rb.Ready(ctx); rbErr != nil {
 			return fmt.Errorf("wasm: update failed (%v); rollback also failed: %w", err, rbErr)
 		}
@@ -238,6 +284,68 @@ func (h *Handle) Dispose() {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.fiber.Dispose()
+}
+
+// Call 调用当前版本模块导出的 name 函数（ABI 见包文档；入参与返回值
+// 都是字符串）。与 Update 互斥：进行中的调用完整跑完、Update 等待；
+// Update 落定后的调用走新版本。
+func (h *Handle) Call(ctx stdctx.Context, name, arg string) (string, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	mod, fctx := h.ref.get()
+	if mod == nil {
+		return "", fmt.Errorf("wasm: call %s: no active module", name)
+	}
+	fn := mod.ExportedFunction(name)
+	if fn == nil {
+		return "", fmt.Errorf("wasm: call: module has no export %q", name)
+	}
+	if def := fn.Definition(); len(def.ParamTypes()) != 2 || len(def.ResultTypes()) != 1 ||
+		def.ParamTypes()[0] != api.ValueTypeI32 || def.ParamTypes()[1] != api.ValueTypeI32 ||
+		def.ResultTypes()[0] != api.ValueTypeI64 {
+		return "", fmt.Errorf("wasm: call %s: export signature must be (i32, i32) -> i64", name)
+	}
+	callCtx := stdctx.WithValue(ctx, fiberCtxKey{}, fctx)
+
+	// 入参经 stc_alloc 写入 guest 内存；空调用跳过分配。
+	var inPtr uint64
+	free := mod.ExportedFunction("stc_free")
+	if len(arg) > 0 {
+		alloc := mod.ExportedFunction("stc_alloc")
+		if alloc == nil {
+			return "", fmt.Errorf("wasm: call %s: module has no stc_alloc export", name)
+		}
+		res, err := alloc.Call(callCtx, uint64(len(arg)))
+		if err != nil {
+			return "", fmt.Errorf("wasm: call %s: stc_alloc: %w", name, err)
+		}
+		inPtr = res[0]
+		if !mod.Memory().Write(uint32(inPtr), []byte(arg)) {
+			return "", fmt.Errorf("wasm: call %s: input does not fit guest memory", name)
+		}
+		if free != nil {
+			defer func() { _, _ = free.Call(callCtx, inPtr, uint64(len(arg))) }()
+		}
+	}
+
+	res, err := fn.Call(callCtx, inPtr, uint64(len(arg)))
+	if err != nil {
+		return "", fmt.Errorf("wasm: call %s: %w", name, err)
+	}
+	ptr, ln := uint32(res[0]>>32), uint32(res[0])
+	if ln == 0 {
+		return "", nil
+	}
+	b, ok := mod.Memory().Read(ptr, ln)
+	if !ok {
+		return "", fmt.Errorf("wasm: call %s: result out of bounds", name)
+	}
+	out := string(b) // 拷出后才释放 guest 侧缓冲
+	if free != nil {
+		_, _ = free.Call(callCtx, uint64(ptr), uint64(ln))
+	}
+	return out, nil
 }
 
 // ------------------------------------------------------------------

@@ -4,15 +4,17 @@ package wasm
 // 刻意不依赖 wabt/tinygo：guest 极小且全部静态，手写编码保证
 // 测试字节码完全可控（包括构造畸形与 trap 模块）。
 
-// 类型表（本 ABI 固定四个签名）：
+// 类型表（本 ABI 固定六个签名）：
 //
 //	0: (i32,i32,i32,i32) -> i32   provide / get
 //	1: (i32,i32) -> i32           get_size
-//	2: (i32,i32) -> ()            log
+//	2: (i32,i32) -> ()            log / stc_free
 //	3: () -> ()                   start / stop
+//	4: (i32) -> i32               stc_alloc
+//	5: (i32,i32) -> i64           invoke
 //
 // 导入函数索引：0=provide 1=get_size 2=get 3=log；
-// 本地函数（start/stop）从索引 4 起。
+// 本地函数（start/stop/extra）从索引 4 起。
 const (
 	fnProvide = 0
 	fnGetSize = 1
@@ -49,17 +51,30 @@ func sleb(v int64) []byte {
 	}
 }
 
-func i32c(v int) []byte  { return append([]byte{0x41}, sleb(int64(v))...) }
-func callf(i int) []byte { return append([]byte{0x10}, uleb(uint64(i))...) }
-func lget(i int) []byte  { return append([]byte{0x20}, uleb(uint64(i))...) }
-func lset(i int) []byte  { return append([]byte{0x21}, uleb(uint64(i))...) }
+func i32c(v int) []byte   { return append([]byte{0x41}, sleb(int64(v))...) }
+func i64c(v int64) []byte { return append([]byte{0x42}, sleb(v)...) }
+func callf(i int) []byte  { return append([]byte{0x10}, uleb(uint64(i))...) }
+func lget(i int) []byte   { return append([]byte{0x20}, uleb(uint64(i))...) }
+func lset(i int) []byte   { return append([]byte{0x21}, uleb(uint64(i))...) }
+func br(i int) []byte     { return append([]byte{0x0C}, uleb(uint64(i))...) }
+func brIf(i int) []byte   { return append([]byte{0x0D}, uleb(uint64(i))...) }
 
 var (
-	opDrop    = []byte{0x1a}
-	opUnreach = []byte{0x00}
-	opIf      = []byte{0x04, 0x40} // void block
-	opEnd     = []byte{0x0b}
-	opI32Ne   = []byte{0x47}
+	opDrop     = []byte{0x1a}
+	opUnreach  = []byte{0x00}
+	opIf       = []byte{0x04, 0x40} // void block
+	opBlock    = []byte{0x02, 0x40}
+	opLoop     = []byte{0x03, 0x40}
+	opEnd      = []byte{0x0b}
+	opI32Ne    = []byte{0x47}
+	opI32Add   = []byte{0x6a}
+	opI32Load  = []byte{0x28, 0x02, 0x00} // align=4, offset=0
+	opI32Store = []byte{0x36, 0x02, 0x00}
+	opI64Shl   = []byte{0x86}
+	opI64Or    = []byte{0x84}
+	opI64Add   = []byte{0x7c}
+	opI64ExtU  = []byte{0xad}                   // i64.extend_i32_u
+	opMemCopy  = []byte{0xfc, 0x0a, 0x00, 0x00} // memory.copy mem0←mem0
 )
 
 func cat(bs ...[]byte) []byte {
@@ -85,10 +100,19 @@ type guestData struct {
 	s   string
 }
 
+// guestFunc 是 start/stop 之外的额外导出函数。
+type guestFunc struct {
+	name   string
+	typ    byte   // 类型表索引
+	instrs []byte // 指令序列（不含结尾 0x0b）
+	locals int    // 额外 i32 局部变量数（参数之后编号）
+}
+
 type guestSpec struct {
 	start  []byte // 指令序列（不含结尾 0x0b）；nil 表示不导出 start
 	stop   []byte
 	locals int // start 的 i32 局部变量数
+	extra  []guestFunc
 	data   []guestData
 }
 
@@ -98,6 +122,8 @@ func buildGuest(g guestSpec) []byte {
 		[]byte{0x60, 2, 0x7f, 0x7f, 1, 0x7f},
 		[]byte{0x60, 2, 0x7f, 0x7f, 0},
 		[]byte{0x60, 0, 0},
+		[]byte{0x60, 1, 0x7f, 1, 0x7f},
+		[]byte{0x60, 2, 0x7f, 0x7f, 1, 0x7e},
 	)
 	imp := func(field string, typ byte) []byte {
 		return cat(name("stc"), name(field), []byte{0x00, typ})
@@ -133,6 +159,12 @@ func buildGuest(g guestSpec) []byte {
 		funcs = append(funcs, []byte{3})
 		codes = append(codes, body(g.stop, 0))
 		exports = append(exports, export("stop", 0x00, byte(next)))
+		next++
+	}
+	for _, f := range g.extra {
+		funcs = append(funcs, []byte{f.typ})
+		codes = append(codes, body(f.instrs, f.locals))
+		exports = append(exports, export(f.name, 0x00, byte(next)))
 		next++
 	}
 
@@ -215,4 +247,82 @@ func badGuest() []byte {
 func withModuleName(src []byte, modName string) []byte {
 	sub := cat([]byte{0x00}, uleb(uint64(len(modName)+1)), name(modName))
 	return cat(src, section(0, cat(name("name"), sub)))
+}
+
+// callGuest：可调用 guest。stc_alloc 是 bump 分配器（堆指针存 addr 0，
+// 初值 4096）；invoke 用 memory.copy 把 prefix 与入参拼进 addr 8192 的
+// 暂存区后返回——证明入参真实跨边界传入、结果真实传回；stc_free 记
+// "freed" 日志（测试观察入参与结果两块缓冲都被释放）。
+func callGuest(prefix string) []byte {
+	const (
+		bumpOff   = 0
+		prefixOff = 16
+		freedOff  = 64
+		scratch   = 8192
+	)
+	return buildGuest(guestSpec{
+		extra: []guestFunc{
+			{
+				name: "stc_alloc", typ: 4, locals: 1,
+				instrs: cat(
+					i32c(bumpOff), opI32Load, lset(1), // r = mem[0]
+					i32c(bumpOff), lget(1), lget(0), opI32Add, opI32Store, // mem[0] = r+n
+					lget(1),
+				),
+			},
+			{
+				name: "stc_free", typ: 2,
+				instrs: cat(i32c(freedOff), i32c(5), callf(fnLog)),
+			},
+			{
+				name: "invoke", typ: 5,
+				instrs: cat(
+					i32c(scratch), i32c(prefixOff), i32c(len(prefix)), opMemCopy,
+					i32c(scratch+len(prefix)), lget(0), lget(1), opMemCopy,
+					i64c(scratch), i64c(32), opI64Shl,
+					i64c(int64(len(prefix))), lget(1), opI64ExtU, opI64Add,
+					opI64Or,
+				),
+			},
+		},
+		data: []guestData{
+			{bumpOff, "\x00\x10\x00\x00"}, // bump = 4096（小端）
+			{prefixOff, prefix},
+			{freedOff, "freed"},
+		},
+	})
+}
+
+// spinGuest：invoke 先记 "spinning" 日志，然后空转自旋直到宿主提供
+// 字符串服务 "release"，最后返回静态结果。不导出 stc_alloc（空调用
+// 无需分配）。用于验证 Call 与 Update 互斥。
+func spinGuest(result string) []byte {
+	const (
+		keyOff = 16 // "release"
+		resOff = 64
+		logOff = 96
+	)
+	packed := int64(resOff)<<32 | int64(len(result))
+	return buildGuest(guestSpec{
+		extra: []guestFunc{
+			{
+				name: "invoke", typ: 5,
+				instrs: cat(
+					i32c(logOff), i32c(8), callf(fnLog),
+					opBlock,
+					opLoop,
+					i32c(keyOff), i32c(7), callf(fnGetSize),
+					i32c(-1), opI32Ne,
+					brIf(1), // n != -1：退出自旋
+					br(0),
+					opEnd,
+					opEnd,
+					i64c(packed),
+				),
+			},
+		},
+		data: []guestData{
+			{keyOff, "release"}, {resOff, result}, {logOff, "spinning"},
+		},
+	})
 }
