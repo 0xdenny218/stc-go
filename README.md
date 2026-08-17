@@ -124,6 +124,11 @@ func main() {
 - **`Gone()` returns once the fiber leaves the registry** (Gone or Failed);
   **`Ready()`** returns on Active / Failed / Gone (nil / load error /
   `ErrDisposed` respectively).
+- **`Load` is asynchronous**: it returns a handle immediately and `Apply`
+  runs later on the orchestrator. If a fiber's `Apply` immediately consumes
+  what sibling fibers provide (e.g. starts a serving loop), await the
+  providers' `Ready` before loading it — otherwise its first actions can
+  observe a not-yet-registered world (bootstrap ordering).
 
 ## Verification = the five metatheory theorems (paper §4.4)
 
@@ -218,6 +223,43 @@ and the host invokes it with `handle.Call(ctx, "invoke", args)`.
 survives atomic-save renames), debounces, and runs `Handle.Update` on every
 change. Failed updates keep the old version serving; results are reported
 through an `OnReload` callback.
+
+## Stable registries (`stc-go/registry`)
+
+The **stable registry** pattern: one fiber provides a registry whose key
+identity never changes (empty `Inject`, so it survives every cascade), and
+member fibers register themselves as revertible effects (inverse =
+unregister). Consumers read the current view per use, so membership churn
+never reloads them — this is what lets
+[stc-agent](https://github.com/0xdenny218/stc-agent) hot-swap tools
+mid-conversation without the agent loop noticing.
+
+```go
+var KeyTools = stc.NewKey[*registry.Registry[Tool]]("tools")
+
+// one stable provider fiber
+root.Load(registry.Component[Tool]("toolset", KeyTools))
+
+// each member fiber: registration is a revertible effect
+stc.Component{
+	Name:   "tool:" + t.Name,
+	Inject: []stc.Key{KeyTools},
+	Apply: func(c *stc.Context) (stc.Inverse, error) {
+		ts, err := stc.Service[*registry.Registry[Tool]](c, KeyTools)
+		if err != nil {
+			return nil, err
+		}
+		return ts.Register(t.Name, t), nil
+	},
+}
+```
+
+`Register` returns the unregistering inverse (idempotent); re-registering a
+name replaces the value, and a superseded inverse never deletes the newer
+registration. `Lookup` / `List` / `Names` give the current view (`List` is
+sorted by name). Extracted from two independent uses in stc-agent (tool
+registry and slash-command registry) through the reflux review
+([#2](https://github.com/0xdenny218/stc-go/issues/2)).
 
 ## Example application
 

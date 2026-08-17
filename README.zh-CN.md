@@ -117,6 +117,10 @@ func main() {
   读到上一周期（已回卷）的 context 是合法的竞态结果。
 - **`Gone()` 在 fiber 出册（Gone 或 Failed）时返回**；**`Ready()`** 在
   Active / Failed / Gone 时返回（分别对应 nil / 装载错误 / `ErrDisposed`）。
+- **`Load` 是异步的**：立即返回句柄，`Apply` 随后由 orchestrator 执行。
+  若某 fiber 的 `Apply` 立即消费兄弟 fiber 提供的能力（例如启动服务
+  循环），先等提供者的 `Ready` 再装载它——否则它的首批动作可能看到
+  一个尚未注册完成的世界（启动编排顺序）。
 
 ## 验收 = 五条元理论定理（论文 §4.4）
 
@@ -203,6 +207,40 @@ func init() {
 `hmr.Watch(ctx, handle, "guest.wasm")` 监听文件（目录级，兼容原子保存
 的 rename 形态），防抖后对每次变化执行 `Handle.Update`。更新失败时
 旧版本继续服役；结果经 `OnReload` 回调上报。
+
+## 稳定注册表（`stc-go/registry`）
+
+**稳定注册表**模式：一个 fiber 提供键身份永不变的注册表（Inject 为
+空 → 挺过一切级联重载），成员 fiber 以可逆效应登记自己（逆 = 注销）。
+消费方按用读取当前视图，成员增删从不引发消费方重载——
+[stc-agent](https://github.com/0xdenny218/stc-agent) 对话中途热替换
+工具而 agent 循环不感知，靠的就是它。
+
+```go
+var KeyTools = stc.NewKey[*registry.Registry[Tool]]("tools")
+
+// 一个稳定的提供者 fiber
+root.Load(registry.Component[Tool]("toolset", KeyTools))
+
+// 每个成员 fiber：登记 = 可逆效应
+stc.Component{
+	Name:   "tool:" + t.Name,
+	Inject: []stc.Key{KeyTools},
+	Apply: func(c *stc.Context) (stc.Inverse, error) {
+		ts, err := stc.Service[*registry.Registry[Tool]](c, KeyTools)
+		if err != nil {
+			return nil, err
+		}
+		return ts.Register(t.Name, t), nil
+	},
+}
+```
+
+`Register` 返回注销逆（幂等）；同名再登记覆盖旧值，被覆盖的旧逆
+不会误删新值。`Lookup` / `List` / `Names` 读当前视图（`List` 按名
+排序）。该包经回流评审从 stc-agent 的两处独立使用（工具注册表与
+斜杠命令注册表）提取（
+[#2](https://github.com/0xdenny218/stc-go/issues/2)）。
 
 ## 示例应用
 
