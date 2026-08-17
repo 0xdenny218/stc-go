@@ -1,96 +1,226 @@
 # stc-go
 
-时空可组合性范式（spatiotemporal composability）的 Go 实现。
+[![CI](https://github.com/0xdenny218/stc-go/actions/workflows/ci.yml/badge.svg)](https://github.com/0xdenny218/stc-go/actions/workflows/ci.yml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/0xdenny218/stc-go.svg)](https://pkg.go.dev/github.com/0xdenny218/stc-go)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-以论文 [*A Programming Paradigm for Spatiotemporal Composability*][paper]
-为唯一规格：**不是** Cordis 的移植——Cordis（TypeScript）是同一范式的另一种
-实现，仅作为测试场景的语料来源。项目规格与里程碑见
-[jiangyu-wiki `stc-go/specs/project.spec.md`][spec]。
+**A Go implementation of the spatiotemporal composability paradigm** — the
+programming model behind [Cordis](https://github.com/cordiverse/cordis)
+(TypeScript) and [DeepSeek Harness (dsh)](https://github.com/deepseek-ai/deepseek-harness),
+DeepSeek's "everything is a plugin" agent harness.
 
-[-paper 钉定 `948a07b` · cordis 参考 `8cc9e33` · 2026-08-14]
+stc-go is specified directly by the paper
+[*A Programming Paradigm for Spatiotemporal Composability*](https://github.com/cordiverse/paper)
+(pinned at `948a07b`, 2026-08-14 draft) — it is **not a port of Cordis**. Cordis
+(pinned at `8cc9e33`) serves only as a reference and a source of test scenarios.
+The acceptance criteria are the paper's five metatheory theorems, implemented as
+property-based tests.
 
-[paper]: https://github.com/cordiverse/paper
-[spec]: https://github.com/jiangyu/jiangyu-wiki/blob/main/stc-go/specs/project.spec.md
+> 中文：[时空可组合性范式](#中文简介)的 Go 实现——论文为规格、五定理为验收，非 Cordis 移植。
 
-## 范式一瞥
+## The paradigm at a glance
 
-- **时间可组合性**：组件装载时注册的每个副作用都携带逆操作，卸载时按
-  LIFO 逆序精确回卷（revertible effects）。
-- **空间可组合性**：组件声明依赖（inject），运行时响应式地管理依赖的满足与
-  失效，fiber 据此在 Pending/Loading/Active/Unloading 之间转移
-  （reactive coeffects）。
-- 两者统一在单一 **context** 类型上：context 是服务容器，也是副作用累加器。
+- **Temporal composability** — every side effect a component registers carries
+  an inverse; unloading a component rewinds its effects in exact LIFO order
+  (revertible effects).
+- **Spatial composability** — components declare their dependencies (inject);
+  the runtime reactively tracks satisfaction and loss of those dependencies,
+  moving each fiber between Pending/Loading/Active/Unloading
+  (reactive coeffects).
+- Both dimensions unify in a single **context** type: a context is both a
+  service container and an effect accumulator.
 
-## 理论对应表（论文 §5.1 Table 2）
+This is what lets a plugin host hot-reload a component — Go or WASM — with
+provable cleanup: no leaked subscriptions, no stale services, no dangling
+state, and dependent components reload automatically.
 
-| 论文构造 | 符号 | stc-go |
+## Install
+
+```sh
+go get github.com/0xdenny218/stc-go
+```
+
+WASM component loading (optional) lives in the subpackage:
+
+```go
+import "github.com/0xdenny218/stc-go/wasm"
+```
+
+## Quick start
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	stc "github.com/0xdenny218/stc-go"
+)
+
+var greeting = stc.NewKey[string]("greeting")
+
+func main() {
+	root := stc.New()
+	defer root.Close()
+
+	// Loaded first, but stays Pending: its dependency isn't satisfied yet.
+	consumer := root.Load(stc.Component{
+		Name:   "consumer",
+		Inject: []stc.Key{greeting},
+		Apply: func(c *stc.Context) (stc.Inverse, error) {
+			msg, err := stc.Service[string](c, greeting)
+			if err != nil {
+				return nil, err
+			}
+			fmt.Println("consumer saw:", msg)
+			return nil, nil
+		},
+	})
+
+	// Provide registers its own inverse; unloading rewinds it automatically.
+	root.Load(stc.Component{
+		Name:    "provider",
+		Provide: []stc.Key{greeting},
+		Apply: func(c *stc.Context) (stc.Inverse, error) {
+			_, err := c.Provide(greeting, "hello, spatiotemporal world")
+			return nil, err
+		},
+	})
+
+	// Becomes Active only after greeting is provided (Theorem: Ordering).
+	if err := consumer.Ready(context.Background()); err != nil {
+		panic(err)
+	}
+}
+```
+
+## Theory mapping (paper §5.1, Table 2)
+
+| Paper construct | Symbol | stc-go |
 |---|---|---|
-| context（第一类上下文） | Γ∞ | `Context`（树状作用域，`New`/`Child`） |
-| 可逆效应 | e ∈ 𝔈Γ | `Context.Effect(install)` |
-| 上下文读写 | get(k) / set(k,v) | `Context.Get` / `Context.Set` |
-| 服务提供 | provide | `Context.Provide`（自动注册撤销效应） |
-| 协效应读取 | d（inject） | `Component.Inject` + `stc.Service[T]` |
-| 隔离 | isolate(k, r) | `Context.Isolate(key, realm)` |
-| 拦截 | intercept(k, ν) | `Context.Intercept(key, meta)` |
-| 组件实例 | ⟨d,p,e,π,σ,τ,θ⟩ | `Fiber`（`Load` 创建，`Dispose` 撤退） |
-| 注册表 | dom(Fγ) | root `Context` 上的 fiber 注册表 |
-| fiber 状态 | τ | `Pending → Loading → Active → Unloading → (Pending \| Failed)`；显式 `Dispose` → `Gone` |
+| context (first-class) | Γ∞ | `Context` (scoped tree, `New`/`Child`) |
+| revertible effect | e ∈ 𝔈Γ | `Context.Effect(install)` |
+| context read/write | get(k) / set(k,v) | `Context.Get` / `Context.Set` |
+| service provision | provide | `Context.Provide` (auto-registers undo) |
+| coeffect read | d (inject) | `Component.Inject` + `stc.Service[T]` |
+| isolation | isolate(k, r) | `Context.Isolate(key, realm)` |
+| interception | intercept(k, ν) | `Context.Intercept(key, meta)` |
+| component instance | ⟨d,p,e,π,σ,τ,θ⟩ | `Fiber` (`Load` creates, `Dispose` withdraws) |
+| registry | dom(Fγ) | fiber registry on the root `Context` |
+| fiber state | τ | `Pending → Loading → Active → Unloading → (Pending \| Failed)`; explicit `Dispose` → `Gone` |
 
-## 生命周期契约要点
+## Lifecycle contracts (the important bits)
 
-- `Close` 仅限根 context：关停 orchestrator 并回卷整棵树；非根作用域的
-  子树清理用 `Release`（不动系统）。
-- 同键服务换血必须等旧提供者完全撤退（`Dispose` 后 `Gone` 返回）再装载
-  新提供者；重叠窗口内的重复提供被 `ErrDuplicateProvide` 拒绝
-  （论文 Def.58 良构性的 fail-fast 强制）。
-- `Fiber.Context()` 返回当前装载周期的 context；惯性重载会更换它，
-  读到上一周期（已回卷）的 context 是合法的竞态结果。
-- `Gone()` 在 fiber 出册（Gone 或 Failed）时返回；`Ready()` 在 Active/
-  Failed/Gone 时返回（分别对应 nil / 装载错误 / `ErrDisposed`）。
+- **`Close` is root-only**: it shuts the orchestrator down and rewinds the
+  whole tree. For subtree-only cleanup on a non-root scope, use `Release`.
+- **Same-key replacement must wait for `Gone`**: before reloading a provider of
+  an already-provided key, `Dispose` the old one and wait for its `Gone` to
+  return. Overlapping duplicates are rejected with `ErrDuplicateProvide`
+  (fail-fast enforcement of the paper's Def. 58 well-formedness).
+- **`Fiber.Context()` returns the current load cycle's context**; inertial
+  reloads replace it, so observing a previous (already-rewound) cycle's
+  context is a legal race outcome.
+- **`Gone()` returns once the fiber leaves the registry** (Gone or Failed);
+  **`Ready()`** returns on Active / Failed / Gone (nil / load error /
+  `ErrDisposed` respectively).
 
-## 验收 = 五条元理论定理（论文 §4.4）
+## Verification = the five metatheory theorems (paper §4.4)
 
-`property_test.go` 逐条落实为 property-based 测试：
+`property_test.go` turns each theorem into a property-based test:
 
-| 定理 | 性质 |
+| Theorem | Property |
 |---|---|
-| T59 Preservation | 任意操作后注册表良构不变量保持 |
-| T61 Recovery exactness | 撤销 fiber 后的状态 ≡ 其从未装载的状态 |
-| T63 Ordering | fiber 仅在依赖就绪后进入 Loading |
-| T66 Progress | 有界步数内达到静默 |
-| T73 Confluence | 静默终态与调度顺序无关（`-race` + 随机调度） |
+| T59 Preservation | registry well-formedness holds after every operation |
+| T61 Recovery exactness | state after unwinding a fiber ≡ state where it never loaded |
+| T63 Ordering | a fiber enters Loading only after its dependencies are ready |
+| T66 Progress | quiescence within a bounded number of orchestrator steps |
+| T73 Confluence | quiescent end state is independent of schedule order (`-race` + randomized schedules) |
 
 ```sh
 go test -race ./...
 go test -run Property -fuzz FuzzInterleaving -fuzztime 10s ./...
 ```
 
-## M4：WASM 组件装载（`stc/wasm`）
+## WASM components (`stc-go/wasm`)
 
-模块实例化 = 引入，模块关闭 = 撤销（论文 §6.4 的运行时代码路线）：
-fiber 的依赖门控、惯性锁、精确回卷对 WASM 组件与 Go 组件一视同仁。
+Module instantiation = introduction, module close = withdrawal (the paper's
+§6.4 runtime-code route): dependency gating, inertia locks and exact rewinding
+apply to WASM guests exactly as to Go components.
 
-- `wasm.Runtime` 封装 wazero（解释器配置，平台无关）与 `stc` 宿主模块；
-  guest 经导出函数 `start()/stop()` 参与生命周期，宿主函数
-  `provide/get/get_size/log` 在 fiber 自己的 context 上登记服务——
-  卸载回卷由 M1 机制保证，guest 无需自登记清理。
-- `wasm.Load` 先探针（编译+试实例化）再装载；`Handle.Update` 实现
-  原子换血：探针失败旧版本原样保留，start trap 自动用旧字节回滚。
-- 验收（`wasm/wasm_test.go`）：HMR 三契约（重载、跨边界依赖链、
-  失败回滚）+ 规格 Test/WasmRollback + T61 跨边界卸载精确性。
-- 测试 guest 为手写 WASM 二进制（`guest_test.go` 的微型编码器），
-  零工具链依赖。
+- `wasm.Runtime` wraps [wazero](https://github.com/tetratelabs/wazero)
+  (interpreter config, platform-independent) plus an `stc` host module. Guests
+  participate via exported `start()`/`stop()`; host functions
+  `provide/get/get_size/log` register services on the fiber's own context —
+  rewind on unload is guaranteed by the core mechanism, guests register no
+  cleanup themselves.
+- `wasm.Load` probes (compile + trial instantiation) before loading;
+  `Handle.Update` performs atomic hot-swap: probe failure leaves the old
+  version intact, a start trap rolls back to the old bytes automatically.
+- Acceptance (`wasm/wasm_test.go`): the three HMR contracts (reload,
+  cross-boundary dependency chain, failure rollback) + spec Test/WasmRollback
+  + T61 cross-boundary unload exactness.
+- Test guests are hand-encoded WASM binaries (a tiny encoder in
+  `guest_test.go`) — zero toolchain dependencies.
 
-## 与论文/Cordis 的已记录偏差
+## Relation to Cordis and DeepSeek Harness
 
-- 无 Proxy：协效应访问走显式泛型 `stc.Service[T]`（论文 §6.4 认可的编译期路线）。
-- 并发模型：单一 RWMutex + 中心 orchestrator goroutine 串行化 fiber 转移；
-  Apply/逆操作在锁外 goroutine 中运行（论文不规定并发模型，此为 D3 决策）。
-- 嵌套子 fiber 不随父 fiber 级联卸载（D7 收窄）。
-- 同 key 重复 provide 排除在汇合保证之外（D7，对应定理条件）。
-- 效应累加发生在注册点（Effect/Apply 返回值），未实现论文迭代器式的
-  持续 yield——验收场景未依赖，列为后续扩展。
+The spatiotemporal composability paradigm has one specification (the paper)
+and several implementations:
+
+| Project | Language | Role |
+|---|---|---|
+| [cordiverse/paper](https://github.com/cordiverse/paper) | — | the specification (preprint, actively revised) |
+| [cordiverse/cordis](https://github.com/cordiverse/cordis) | TypeScript | reference implementation; drives the [Koishi](https://koishi.chat) plugin ecosystem |
+| [deepseek-ai/deepseek-harness](https://github.com/deepseek-ai/deepseek-harness) | TypeScript | DeepSeek's agent harness (dsh), "everything is a plugin", driven by Cordis |
+| **stc-go** (this repo) | Go | independent implementation; paper as spec, five theorems as acceptance |
+
+If you are building a plugin system, an agent harness, or a hot-reload host in
+Go and want the same composition guarantees that Cordis gives the TypeScript
+world (dependency-gated loading, exact effect rewind, reactive reload of
+dependents), stc-go is that library.
+
+Not ported from Cordis (by design): the four event-dispatch modes
+(`emit/parallel/serial/bail/waterfall`), `ctx.plugin()` with config schemas,
+and the `hmr`/`loader` satellite packages are Cordis ecosystem concerns, not
+paradigm core. Go replacements are idiomatic: explicit typed accessors instead
+of `Proxy` + declaration merging, static component registration instead of the
+Go plugin package (which cannot unload), and WASM for runtime-loaded code.
+
+## Documented deviations from the paper / Cordis
+
+- No `Proxy`: coeffect access goes through the explicit generic
+  `stc.Service[T]` (the compile-time route the paper's §6.4 endorses).
+- Concurrency model: a single RWMutex plus a central orchestrator goroutine
+  serializes fiber transitions; `Apply`/inverses run outside the lock in their
+  own goroutines (the paper does not prescribe a concurrency model).
+- Nested child fibers do not cascade-dispose with their parent (a scoped
+  narrowing, documented in the project spec).
+- Duplicate provide of the same key is excluded from the confluence guarantee
+  (matching the theorems' conditional statements).
+- Effect accumulation happens at registration (return values of
+  `Effect`/`Apply`); the paper's iterator-style continuous yield is not
+  implemented — no acceptance scenario depends on it.
+
+## 中文简介
+
+stc-go 是时空可组合性范式的 Go 实现。该范式由论文
+《A Programming Paradigm for Spatiotemporal Composability》定义，
+TypeScript 侧的实现是 Cordis（Koishi 生态的底座），DeepSeek 的 agent
+harness（DeepSeek Harness / dsh，"一切皆插件"）即建立在 Cordis 之上。
+
+- **时间可组合性**：组件注册的每个副作用都携带逆操作，卸载时按 LIFO 逆序
+  精确回卷；
+- **空间可组合性**：组件声明依赖，运行时响应式地管理依赖的满足与失效，
+  依赖变化时 fiber 自动重载；
+- **验收即定理**：论文 §4.4 的五条元理论定理逐条落成 property-based 测试
+  （`-race` + 随机调度 + fuzz）；
+- **WASM 组件**（`stc-go/wasm`）：基于 wazero，模块实例化=引入、关闭=撤销，
+  `Handle.Update` 原子换血，失败自动回滚旧版本。
+
+本项目以论文为唯一规格，**不是** Cordis 的移植；Cordis 仅作语义参考与
+测试语料库。详见上文英文文档。
 
 ## License
 
-MIT
+[MIT](LICENSE)
