@@ -232,6 +232,25 @@ paradigm core. Go replacements are idiomatic: explicit typed accessors instead
 of `Proxy` + declaration merging, static component registration instead of the
 Go plugin package (which cannot unload), and WASM for runtime-loaded code.
 
+## Related projects
+
+stc-go sits in a specific layer — **runtime dependency reactivity with provable
+unload semantics** — that is currently empty in the Go ecosystem. Adjacent
+projects solve neighboring layers, and compose with stc-go rather than compete:
+
+| Layer | Projects | They solve | They don't |
+|---|---|---|---|
+| Startup-time DI | [uber/fx](https://github.com/uber-go/fx), [google/wire](https://github.com/google/wire), [sarulabs/di](https://github.com/sarulabs/di) | static dependency graphs, app-level lifecycle hooks | runtime (un)provision, cascade reload of dependents |
+| WASM plugin loading | [Extism](https://github.com/extism/extism), [knqyf263/go-plugin](https://github.com/knqyf263/go-plugin) | sandboxed loading/calling of WASM plugins, codegen, OCI distribution | inter-plugin dependencies, exact unload semantics |
+| Process plugins | [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin) | crash isolation via subprocess + gRPC | in-place hot swap, dependency graph |
+| Dev-time reload | [air](https://github.com/air-verse/air), [edwingeng/hotswap](https://github.com/edwingeng/hotswap) | restarting/swapping Go code while developing | state preservation, rollback, dependency tracking |
+
+stc-go's WASM layer is built on [wazero](https://github.com/tetratelabs/wazero) —
+the same runtime Extism and go-plugin use. The layers are complementary:
+mechanisms like typed host↔guest calls, sandbox hardening, and OCI artifact
+distribution are natural future integrations, pulled in as real consumers
+demand them.
+
 ## Documented deviations from the paper / Cordis
 
 - No `Proxy`: coeffect access goes through the explicit generic

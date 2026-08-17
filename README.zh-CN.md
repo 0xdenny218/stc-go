@@ -216,6 +216,23 @@ README。
 `Proxy` + declaration merging；静态组件注册替代 Go plugin 包
 （无法卸载）；运行时装载的代码走 WASM。
 
+## 相邻项目
+
+stc-go 所处的层——**运行期依赖响应与可证明的卸载语义**——目前在 Go 生态
+是空位。相邻项目解决的是相邻的层，与 stc-go 互补而非竞争：
+
+| 层 | 项目 | 解决什么 | 不解决什么 |
+|---|---|---|---|
+| 启动期依赖注入 | [uber/fx](https://github.com/uber-go/fx)、[google/wire](https://github.com/google/wire)、[sarulabs/di](https://github.com/sarulabs/di) | 静态依赖图、应用级生命周期钩子 | 运行期提供/撤销、依赖方级联重载 |
+| WASM 插件装载 | [Extism](https://github.com/extism/extism)、[knqyf263/go-plugin](https://github.com/knqyf263/go-plugin) | 沙箱化装载与调用 WASM 插件、代码生成、OCI 分发 | 插件间依赖、精确卸载语义 |
+| 进程插件 | [hashicorp/go-plugin](https://github.com/hashicorp/go-plugin) | 子进程 + gRPC 的崩溃隔离 | 原地热替换、依赖图 |
+| 开发期热重载 | [air](https://github.com/air-verse/air)、[edwingeng/hotswap](https://github.com/edwingeng/hotswap) | 开发时重启/替换 Go 代码 | 状态保持、失败回滚、依赖追踪 |
+
+stc-go 的 WASM 层构建在 [wazero](https://github.com/tetratelabs/wazero)
+之上——与 Extism、go-plugin 同一运行时。层与层互补：带类型的
+host↔guest 调用、沙箱加固、OCI 产物分发等机制是自然的后续集成方向，
+由真实消费者的需求牵引落地。
+
 ## 与论文/Cordis 的已记录偏差
 
 - 无 `Proxy`：协效应访问走显式泛型 `stc.Service[T]`（论文 §6.4 认可的
