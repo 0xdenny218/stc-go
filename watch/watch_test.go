@@ -224,8 +224,10 @@ func TestDirWatch(t *testing.T) {
 	if rec.last().Path != entry {
 		t.Fatalf("event path = %q, want %q", rec.last().Path, entry)
 	}
-	if rec.last().Op != watch.Create {
-		t.Fatalf("event op = %v, want create", rec.last().Op)
+	// 新建即写入的平台差异：Linux inotify 的最后事件是 write，macOS
+	// fsevents 合并为 create——两者都算"条目出现"。
+	if rec.last().Op != watch.Create && rec.last().Op != watch.Write {
+		t.Fatalf("event op = %v, want create or write", rec.last().Op)
 	}
 
 	if err := os.Remove(entry); err != nil {
