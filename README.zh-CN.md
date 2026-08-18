@@ -211,6 +211,17 @@ func init() {
 的 rename 形态），防抖后对每次变化执行 `Handle.Update`。更新失败时
 旧版本继续服役；结果经 `OnReload` 回调上报。
 
+### 监听原语（`stc-go/watch`）
+
+`watch.Watch(ctx, path, opts)` 是 hmr 背后的极简防抖监听原语：文件或
+目录上的事件停歇一个防抖窗口（默认 200ms）后，`OnFire` 以窗口内最后
+事件的路径与类别（create/write/remove/rename）回调一次。刻意不做
+diff、不带领域语义——fire 意味着什么由消费方决定（stat 定
+reload/gone，或全量扫目录做装/卸差分）。文件形态监听所在目录（原子
+保存 rename 安全）；目录形态监听目录自身。经回流评审从 stc-agent
+skills 包的两套手写 fsnotify 循环提取（
+[#6](https://github.com/0xdenny218/stc-go/issues/6)）。
+
 ## 稳定注册表（`stc-go/registry`）
 
 **稳定注册表**模式：一个 fiber 提供键身份永不变的注册表（Inject 为

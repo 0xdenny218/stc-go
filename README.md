@@ -228,6 +228,19 @@ survives atomic-save renames), debounces, and runs `Handle.Update` on every
 change. Failed updates keep the old version serving; results are reported
 through an `OnReload` callback.
 
+### Watch primitive (`stc-go/watch`)
+
+`watch.Watch(ctx, path, opts)` is the minimal debounced file-watching
+primitive underneath `hmr`: events on a file or directory settle for a
+debounce window (default 200 ms), then `OnFire` fires once with the last
+event's path and op (create/write/remove/rename). Deliberately no diffing,
+no domain semantics — the consumer decides what a fire means (stat for
+reload-or-gone, or rescan a directory and diff). File mode watches the
+parent directory (atomic-save rename safe); directory mode watches the
+directory itself. Extracted from two hand-rolled fsnotify loops in
+stc-agent's skills package through the reflux review
+([#6](https://github.com/0xdenny218/stc-go/issues/6)).
+
 ## Stable registries (`stc-go/registry`)
 
 The **stable registry** pattern: one fiber provides a registry whose key
