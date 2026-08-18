@@ -107,7 +107,7 @@ func main() {
 | isolation | isolate(k, r) | `Context.Isolate(key, realm)` |
 | interception | intercept(k, ν) | `Context.Intercept(key, meta)` |
 | component instance | ⟨d,p,e,π,σ,τ,θ⟩ | `Fiber` (`Load` creates, `Dispose` withdraws) |
-| registry | dom(Fγ) | fiber registry on the root `Context` |
+| registry | dom(Fγ) | fiber registry per tree; snapshot via `Context.Fibers()` |
 | fiber state | τ | `Pending → Loading → Active → Unloading → (Pending \| Failed)`; explicit `Dispose` → `Gone` |
 
 ## Lifecycle contracts (the important bits)
@@ -124,6 +124,10 @@ func main() {
 - **`Gone()` returns once the fiber leaves the registry** (Gone or Failed);
   **`Ready()`** returns on Active / Failed / Gone (nil / load error /
   `ErrDisposed` respectively).
+- **`Context.Fibers()` enumerates the tree's registry**: a read-only,
+  ID-ordered snapshot of every loaded-but-not-yet-withdrawn fiber (one
+  registry per `New()` tree; disposed and failed fibers have already left,
+  so they only vanish from later snapshots — no registration side needed).
 - **`Load` is asynchronous**: it returns a handle immediately and `Apply`
   runs later on the orchestrator. If a fiber's `Apply` immediately consumes
   what sibling fibers provide (e.g. starts a serving loop), await the

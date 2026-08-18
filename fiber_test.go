@@ -412,3 +412,138 @@ func TestNestedLoad(t *testing.T) {
 		t.Fatalf("child effect after root.Close = %d, want 0", got)
 	}
 }
+
+// ------------------------------------------------------------------
+// 枚举 API（stc-go#4）：Fibers 是注册表的只读快照，取代消费者侧
+// 与注册表并行维护的手工目录（副本与真相漂移的根治）。
+// ------------------------------------------------------------------
+
+// 装载后枚举含全部在册 fiber：Active 与依赖蛰伏（Pending）都在，
+// ID 升序；同树的子作用域 context 看到同一视图；异树互不可见。
+func TestFibersSnapshot(t *testing.T) {
+	root := New()
+	defer root.Close()
+	k := UntypedKey("dep")
+
+	root.Load(Component{ // 依赖缺失 → 蛰伏在册
+		Name:   "gated",
+		Inject: []Key{k},
+		Apply:  func(ctx *Context) (Inverse, error) { return nil, nil },
+	})
+	a := root.Load(Component{Name: "a", Apply: func(ctx *Context) (Inverse, error) { return nil, nil }})
+	child := root.Child()
+	b := child.Load(Component{Name: "b", Apply: func(ctx *Context) (Inverse, error) { return nil, nil }})
+
+	g := stdctx.Background()
+	if err := a.Ready(g); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Ready(g); err != nil {
+		t.Fatal(err)
+	}
+
+	fs := root.Fibers()
+	if len(fs) != 3 {
+		t.Fatalf("Fibers() = %d 项, want 3", len(fs))
+	}
+	if !(fs[0].ID() < fs[1].ID() && fs[1].ID() < fs[2].ID()) {
+		t.Fatalf("Fibers() 未按 ID 升序: %v", []uint64{fs[0].ID(), fs[1].ID(), fs[2].ID()})
+	}
+	for _, f := range fs {
+		var want FiberState
+		switch f.Name() {
+		case "gated":
+			want = StatePending
+		case "a", "b":
+			want = StateActive
+		default:
+			t.Fatalf("unexpected fiber %q in snapshot", f.Name())
+		}
+		if f.State() != want {
+			t.Fatalf("fiber %q state = %v, want %v", f.Name(), f.State(), want)
+		}
+	}
+	// 同树的子作用域观察同一注册表。
+	if got := len(child.Fibers()); got != 3 {
+		t.Fatalf("child.Fibers() = %d 项, want 3（同树共享注册表）", got)
+	}
+
+	// 另一棵树互不可见。
+	other := New()
+	defer other.Close()
+	if got := len(other.Fibers()); got != 0 {
+		t.Fatalf("other.Fibers() = %d 项, want 0（异树隔离）", got)
+	}
+}
+
+// 卸载与装载失败都出册：Dispose→Gone 后从快照消失；apply 出错
+// （Failed）的 fiber 同样不在册。
+func TestFibersAfterDispose(t *testing.T) {
+	root := New()
+	defer root.Close()
+
+	f := root.Load(Component{Name: "tmp", Apply: func(ctx *Context) (Inverse, error) { return nil, nil }})
+	if err := f.Ready(stdctx.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(root.Fibers()); got != 1 {
+		t.Fatalf("Fibers() = %d 项, want 1", got)
+	}
+	f.Dispose()
+	if err := f.Gone(stdctx.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := len(root.Fibers()); got != 0 {
+		t.Fatalf("dispose 后 Fibers() = %d 项, want 0", got)
+	}
+
+	bad := root.Load(Component{Name: "bad", Apply: func(ctx *Context) (Inverse, error) {
+		return nil, fmt.Errorf("boom")
+	}})
+	if err := bad.Ready(stdctx.Background()); err == nil {
+		t.Fatal("want load error")
+	}
+	if got := len(root.Fibers()); got != 0 {
+		t.Fatalf("装载失败后 Fibers() = %d 项, want 0", got)
+	}
+}
+
+// 并发装载/撤退/枚举：快照经 RLock 读取、句柄状态原子现读，
+// -race 背书无竞态；全部撤退后注册表回到空。
+func TestFibersConcurrent(t *testing.T) {
+	root := New()
+	defer root.Close()
+
+	const workers = 4
+	const rounds = 50
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			for i := 0; i < rounds; i++ {
+				f := root.Load(Component{
+					Name:  fmt.Sprintf("w%d-%d", w, i),
+					Apply: func(ctx *Context) (Inverse, error) { return nil, nil },
+				})
+				f.Dispose()
+				// 现读快照句柄（快照后状态可变，不对其值断言；
+				// 此处为 -race 覆盖并发读路径）。
+				for _, x := range root.Fibers() {
+					_ = x.ID()
+					_ = x.State()
+				}
+			}
+		}(w)
+	}
+	wg.Wait()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(root.Fibers()) == 0 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("全部撤退后 Fibers() 未归零: %d 项", len(root.Fibers()))
+}

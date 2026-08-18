@@ -103,7 +103,7 @@ func main() {
 | 隔离 | isolate(k, r) | `Context.Isolate(key, realm)` |
 | 拦截 | intercept(k, ν) | `Context.Intercept(key, meta)` |
 | 组件实例 | ⟨d,p,e,π,σ,τ,θ⟩ | `Fiber`（`Load` 创建，`Dispose` 撤退） |
-| 注册表 | dom(Fγ) | root `Context` 上的 fiber 注册表 |
+| 注册表 | dom(Fγ) | 每棵树一份 fiber 注册表，`Context.Fibers()` 快照枚举 |
 | fiber 状态 | τ | `Pending → Loading → Active → Unloading → (Pending \| Failed)`；显式 `Dispose` → `Gone` |
 
 ## 生命周期契约要点
@@ -117,6 +117,9 @@ func main() {
   读到上一周期（已回卷）的 context 是合法的竞态结果。
 - **`Gone()` 在 fiber 出册（Gone 或 Failed）时返回**；**`Ready()`** 在
   Active / Failed / Gone 时返回（分别对应 nil / 装载错误 / `ErrDisposed`）。
+- **`Context.Fibers()` 枚举本树注册表**：在册未撤退 fiber 的只读快照，
+  按 ID 升序（每个 `New()` 一份注册表；已 Dispose 与装载失败的 fiber
+  均已出册，只会在之后的快照中消失——消费方无需再自建登记面）。
 - **`Load` 是异步的**：立即返回句柄，`Apply` 随后由 orchestrator 执行。
   若某 fiber 的 `Apply` 立即消费兄弟 fiber 提供的能力（例如启动服务
   循环），先等提供者的 `Ready` 再装载它——否则它的首批动作可能看到

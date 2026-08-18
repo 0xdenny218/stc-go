@@ -3,6 +3,7 @@ package stc
 import (
 	stdctx "context"
 	"errors"
+	"sort"
 	"sync/atomic"
 )
 
@@ -95,6 +96,23 @@ func (c *Context) Load(comp Component) *Fiber {
 		f.state.Store(uint32(StateFailed))
 	}
 	return f
+}
+
+// Fibers 返回本树 fiber 注册表的只读快照：经 Load 装载且尚未出册的
+// 全部 fiber 句柄，按 ID 升序。注册表随 New() 每棵树一份——根与任意
+// 子作用域 context 观察的是同一棵树的视图，多棵树互不可见。
+// 快照只固定成员集合，不冻结生命周期：句柄的 ID/Name/State 等访问器
+// 并发安全，状态以现读为准。Dispose→Gone 与装载失败（Failed）的
+// fiber 均已出册，不会出现在之后的快照中。
+func (c *Context) Fibers() []*Fiber {
+	c.sh.mu.RLock()
+	defer c.sh.mu.RUnlock()
+	out := make([]*Fiber, 0, len(c.sh.registry))
+	for _, f := range c.sh.registry {
+		out = append(out, f)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].id < out[j].id })
+	return out
 }
 
 // Dispose 请求撤退 fiber：回卷其全部效应并从注册表移除。
